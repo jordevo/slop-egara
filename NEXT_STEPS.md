@@ -114,28 +114,65 @@ cabinas, fuentes, alcantarillas. Todo instanciado y barato.
 
 ---
 
-## Eje 2 · Motor: conducción, tráfico, semáforos, policía
+## Eje 2 · Motor: conducción, física, tráfico, semáforos, policía, peatones
 
-### 2.1 Física de conducción
+### 2.0 Síntomas observados en el navegador → causa en el código → acción
 
-**Hoy.** Modelo cinemático: velocidad escalar con aceleración/frenado/arrastre (`CAR_DRIVE`), giro por ángulo de
-dirección, sin masa, sin deslizamiento, sin pendiente, sin suspensión real.
+| Síntoma | Causa comprobada | Acción (apartado) |
+|---|---|---|
+| El coche atraviesa árboles, farolas, bancos, bolardos, semáforos | El jugador solo colisiona con `allColliders` (edificios, monumentos, parapetos de las rieras). Los props de `street-details.js` y `city-grid.js` son `footprints` que ve el tráfico IA y los peatones, pero **no** el jugador | 2.1.1 |
+| Semáforos siempre en rojo | Un solo reloj global (`SIGNAL_TIMING`, 60 s, todos los cruces en fase) | 2.3 |
+| Coches acumulados / atascos | Varias causas: (a) los coches aparecen en cualquier arista a < 350 m del jugador elegida al azar, así que las zonas con muchas aristas cortas (casco antiguo) reciben más coches por metro; (b) no hay destino: en cada cruce eligen giro, y en los cruces con prioridad por "vía más ancha" las secundarias esperan sin límite; (c) bloqueos mutuos en la caja del cruce (`boxBusy`) sin detección de interbloqueo; (d) rotondas colapsadas en un nodo; (e) vías de sentido único que desembocan en calles saturadas | 2.4 |
+| Zonas con un montón de peatones y otras vacías | Igual que (a): aparición por arista al azar a < 350 m; nada depende del uso del suelo, de los comercios ni de la hora | 2.6 |
+| El tráfico "se ve raro" | Sin distancia de seguridad dependiente de la velocidad, sin indicadores, giros bruscos, sin velocidad por tipo de vía, sin aparcamientos en calzada | 2.4, 2.5 |
 
-**Propuesta (modelo "arcade con bicicleta dinámica")**, en `controllers.js` detrás de `FEATURES.carPhysics`:
-- Modelo de bicicleta con masa, inercia de guiñada, neumáticos con curva de fuerza lateral saturable (Pacejka
-  simplificada): da subviraje/sobreviraje, derrapes al frenar en curva y freno de mano.
-- Reparto de frenada, ABS simple, aceleración limitada por adherencia (patinar al salir).
-- Pendiente (cuando exista terreno): componente de gravedad en el eje longitudinal.
-- Suspensión: 4 muelles-amortiguador visuales (ya hay cabeceo/balanceo; convertirlo en física real sobre el chasis).
-- Colisiones: hoy el coche se para contra los colisionadores; pasar a respuesta con impulso (rebote, pérdida de
-  velocidad proporcional al ángulo) y daño visual opcional.
-- Sensación: cámara con retardo según aceleración lateral, FOV con velocidad, sonido de motor por marchas (ya hay
-  síntesis de motor: añadir caja de 5 marchas).
+### 2.1 Física y colisiones del coche (sin llegar a simulador)
 
-**Verificación.** `tests/controllers.test.cjs` ya cubre teclado/teletransportes; añadir una prueba numérica de la
-dinámica (un coche a 50 km/h frena en < 20 m; no supera 1,2 g lateral). Conmutador para volver al modelo actual.
+**2.1.1 Chocar con lo que hay (prioridad 1, bajo riesgo).**
+- Unificar colisionadores: `main.js` construye una sola **tabla de colisión** con tres clases: *sólido alto* (edificios,
+  monumentos: ya), *sólido bajo* (troncos de árbol ø 0,3–0,6 m, farolas, semáforos, bolardos, papeleras, bancos,
+  marquesinas, contenedores, parapetos) y *franqueable* (setos, alcorques). `street-details.js` y `city-grid.js` ya
+  devuelven `footprints`; basta añadirles `kind` y `radius`, y que `controllers.js` los incluya en `nearColliders`
+  (celdas de 48 m ya existentes).
+- Respuesta física: cilindro (tronco/poste) vs caja del coche → impulso de rebote proporcional a la velocidad y al
+  ángulo, el coche pierde velocidad y se desvía; a baja velocidad se detiene sin "pegarse" (deslizar a lo largo del
+  obstáculo). Para el peatón y la bici: deslizar.
+- Bordillos: subir la acera a baja velocidad con un pequeño salto y traqueteo; a alta velocidad frenar; el jugador
+  puede conducir por la acera (como en GTA) pero con penalización de velocidad y los peatones apartándose.
+- Props rompibles (opcional, fase 2): bolardos, papeleras y señales caen al ser atropellados (instancia que gira y
+  se tumba, sin física continua).
+- Coches del tráfico y jugador: hoy el tráfico esquiva al jugador; falta que el jugador choque contra ellos con
+  respuesta (ambos se frenan, el otro pita y se queda parado unos segundos).
 
-### 2.2 Semáforos reales (y que no estén "siempre en rojo")
+**2.1.2 Modelo de conducción "arcade cuidado".**
+- Bicicleta dinámica con masa (1.300 kg), inercia de guiñada y **neumáticos con fuerza lateral saturable**
+  (Pacejka simplificada): subviraje natural, derrape al frenar fuerte en curva, freno de mano para girar en
+  seco (muy satisfactorio en el casco antiguo).
+- Aceleración limitada por adherencia (patina al salir en mojado), reparto de frenada 60/40, ABS sencillo.
+- **Pendiente** cuando exista el relieve (1.1): gravedad longitudinal y lateral.
+- Suspensión real en el chasis: 4 muelles-amortiguador que responden al balanceo, al cabeceo y a bordillos;
+  transferencia de carga que afecta al agarre.
+- Caja de cambios de 5 marchas para el sonido (hay síntesis de motor) y para la curva de aceleración.
+- Marcha atrás con la cámara girada, giro del volante animado, luces de freno y marcha atrás (ya hay estado de luces).
+- Cámara: retardo según aceleración lateral, FOV con la velocidad, vibración al ir por adoquines (la Plaça Vella
+  y las calles peatonales con `surface=sett|cobblestone` de OSM, ya descargado en `osm_roads.json` pero no usado).
+- Daño visual acumulativo opcional (abolladuras por decal).
+- Conmutador `FEATURES.carPhysics`; pruebas numéricas en `tests/controllers.test.cjs` (frenada 50→0 km/h en
+  < 20 m; aceleración lateral máxima 1,1 g; no atraviesa un poste a 60 km/h).
+
+**2.1.3 Bicicleta y peatón.** Inclinación real en curva con límite de agarre, pedaleo con cadencia, caída si
+se gira demasiado rápido (reinicio suave). Peatón: escaleras y rampas cuando haya relieve, empujar y esquivar.
+
+### 2.2 Mundo con el que interactuar
+
+- **Puertas y pasos**: nada que entrar aún, pero sí pasajes (`highway=pedestrian` bajo edificios) y porches.
+- **Aparcamientos en calzada**: hileras de coches aparcados reales (OSM `parking:lane=*` cuando existe; si no, por
+  clase de vía) que ocupan el carril de aparcamiento modelado (§2.2 del diario): hace las calles reconocibles y
+  explica el ancho de calzada.
+- **Objetos dinámicos sencillos**: toldos que se mueven con el viento, persianas, banderas, ropa tendida en los
+  patios de illa (muy Terrassa), pelotas en las pistas.
+
+### 2.3 Semáforos reales (y que no estén "siempre en rojo")
 
 **Diagnóstico.** Hoy hay **un único reloj global**: todos los cruces de la ciudad cambian a la vez con el mismo ciclo
 de 60 s (26 s verde principal / 26 s verde secundaria). Al circular, el siguiente cruce suele estar en la fase opuesta,
@@ -145,69 +182,115 @@ de ahí la sensación de rojo constante. Además las vías "secundarias" de un c
 1. **Desfase por cruce (onda verde).** Cada nodo semaforizado recibe un `offset` = distancia a lo largo de su vía
    principal desde el inicio del eje ÷ velocidad de diseño (40 km/h). Vías con semáforos coordinados en Terrassa:
    Rambla d'Ègara, Avinguda de Jacquard, Carretera de Montcada, Avinguda del Vallès, Carretera de Rubí, Avinguda de
-   Béjar, Avinguda de les Glòries Catalanes. Implementación: `n.offset` en `road-network.js`; `phaseOf(e)` en
-   `traffic.js` y las cabezas de `street-details.js` leen `signalPhase(elapsed - n.offset, …)`. El audio de
-   semáforos peatonales (`audioSignals`) idem.
-2. **Ciclos por tipo de cruce.** Cruce de dos vías principales: 90 s; principal con secundaria: 60 s con reparto
-   60/40; cruce con solo paso peatonal: semáforo a demanda (verde fijo para coches salvo cuando un peatón espera).
+   Béjar, Avinguda de les Glòries Catalanes, Avinguda de l'Abat Marcet. Implementación: `n.offset` en
+   `road-network.js`; `phaseOf(e)` en `traffic.js` y las cabezas de `street-details.js` leen
+   `signalPhase(elapsed - n.offset, …)`. El audio de semáforos peatonales (`audioSignals`) idem.
+2. **Ciclos por tipo de cruce.** Dos vías principales: 90 s; principal con secundaria: 60 s con reparto 60/40; cruce
+   con solo paso peatonal (los 114 nodos `traffic_signals` sin cruce de vías): verde fijo para coches salvo cuando un
+   peatón pide paso (botón: el peatón IA "pulsa" al llegar).
 3. **Fases por grupo real.** Cruces de 3+ ramales: una fase por grupo (`n.groupCount`) en lugar de "principal/resto".
-   Giros a la izquierda protegidos en avenidas con mediana.
-4. **Ámbar intermitente nocturno** (23:00–06:00 en el modo "Night") en cruces secundarios, como en la realidad.
-5. **Planes reales**: si el Ajuntament publica el inventario de semáforos y sus planes de fases, sustituir las tablas.
+   Giros a la izquierda protegidos en avenidas con mediana (Rambla, Vallès).
+4. **Ámbar intermitente nocturno** (modo "Night") en cruces secundarios, como en la realidad.
+5. **Semáforo visible desde el coche**: repetidor en el lado derecho a la altura del conductor (ya hay poste; añadir
+   cabeza baja), y ámbar de 3 s antes del rojo también en los pasos de peatones (hombre verde parpadeante).
+6. **Planes reales**: si el Ajuntament publica el inventario de semáforos y sus planes de fases, sustituir las tablas.
 
 **Riesgo.** Medio: el tráfico IA y los peatones dependen de las fases. Mitigación: `offset = 0` reproduce exactamente
-el comportamiento actual; los tests de tráfico (`tests/traffic*.test.cjs`) siguen válidos; añadir una prueba de que
-en ningún cruce dos grupos tienen verde a la vez.
+el comportamiento actual; los tests de tráfico siguen válidos; añadir una prueba de que en ningún cruce dos grupos
+tienen verde a la vez.
 
-### 2.3 Tráfico por IA
+### 2.4 IA de tráfico: que circule como una ciudad
 
-- **Rutas con destino.** Hoy los coches eligen movimiento en cada cruce; dar a cada coche un destino (otro nodo del
-  grafo) y una ruta Dijkstra/A* → los flujos se parecen a los reales (entradas/salidas por las rondas, atracción al
-  Centre, polígonos en hora punta). Reusar el grafo `roadGraph` (5.167 nodos).
-- **Comportamientos.** Distancia de seguridad por velocidad, adelantamientos en avenidas de 2 carriles,
-  aparcamiento en doble fila (muy terrassenc), autobuses que paran en paradas reales (OSM `highway=bus_stop`, no
-  descargado aún) siguiendo las líneas reales de TMESA (OSM `route=bus`), rotondas con prioridad al que circula dentro
-  (hoy las rotondas se colapsan en un nodo: tratarlas como anillo).
-- **Densidad por hora y zona.** Curva horaria (punta mañana/tarde) y densidad por clase de vía.
-- **Motos y bicis** en el tráfico (Terrassa tiene carril bici en avenidas: `cycleway=*` en OSM).
-- **Verificación.** `tests/traffic-performance.test.cjs` fija el presupuesto de CPU; mantener < 2 ms por frame.
+**2.4.1 Aparición equilibrada (resuelve las acumulaciones, bajo riesgo).**
+- Presupuesto de coches **por metro de carril y clase de vía**, no por arista: ponderar la elección de arista por su
+  longitud × factor de clase (avenida 1,0; residencial 0,35; servicio 0,1; peatonal 0) y limitar la densidad máxima
+  por tramo (un coche cada 12 m en avenida, cada 25 m en residencial).
+- Aparición preferente en los **bordes de la zona activa** (anillo 250–350 m) y nunca justo delante del jugador;
+  desaparición al salir por el lado opuesto, de forma que el flujo cruza la zona en vez de nacer y morir dentro.
+- **Curva horaria** (ver 2.6) y **factor de zona**: polígonos industriales con tráfico pesado en horas laborales,
+  casco antiguo casi vacío (zona de prioridad invertida / peatonal), rondas siempre cargadas.
 
-### 2.4 Policía: Mossos y Policia Municipal, con criterio
+**2.4.2 Destinos y rutas.** Cada coche recibe un destino (nodo del grafo elegido por atractores: el Centre, la
+Mútua, los polígonos, las salidas a las rondas, la estación) y una ruta A* sobre `roadGraph` (5.167 nodos; precalcular
+rutas entre 200 atractores y reutilizarlas). Ventajas: giros coherentes (el coche no cambia de carril al azar), flujos
+realistas, autobuses por sus líneas, y la posibilidad de misiones de taxi.
+
+**2.4.3 Comportamiento de seguimiento (IDM).** Sustituir la lógica de "frenar si hay alguien delante" por un
+modelo de conductor inteligente (distancia deseada = 2 m + v·1,2 s; aceleración/frenado suaves; variación por
+conductor: agresivo/tranquilo). Elimina acordeones y choques visuales. Velocidad objetivo por vía: 30 km/h
+residencial y Zona 30 (todo el casco antiguo y el Eixample lo son), 50 avenidas, 80–120 rondas (`maxspeed` de OSM ya
+está en `osm_roads.json`; falta exportarlo en `roads`).
+
+**2.4.4 Cruces.** Detección y resolución de **interbloqueos** (si dos coches llevan > 6 s esperándose, el de menor
+prioridad retrocede o cede); tiempo máximo de espera en secundarias (al cabo de 20 s se cuela "a la catalana" si hay
+hueco de 3 s); **aceptación de huecos** real para incorporaciones; **rotondas** como anillo con prioridad al que
+circula dentro (hoy los nodos a < 14 m se fusionan: excluir de la fusión los `roundabout` del grafo, ya marcados en
+el dato); stop y ceda el paso (`n.stop`, 313 cruces) respetados.
+
+**2.4.5 Carriles.** Cambio de carril para adelantar lentos y para colocarse antes del giro (Rambla, avenidas de 2+
+carriles), intermitentes (ya hay estado de luces), paradas en doble fila cortas (repartidores) que obligan a rodear.
+
+**2.4.6 Vehículos.** Autobuses de TMESA por sus **líneas reales** (OSM `route=bus` y `highway=bus_stop`: añadir a la
+consulta Overpass) parando en las paradas con marquesina; furgonetas de reparto, camiones en polígonos, motos y
+bicis (carril bici de OSM `cycleway=*`), patinetes; taxis que paran a recoger; el vehículo del jugador también
+"existe" para la IA (hoy lo esquivan; que también le pitén y le dejen pasar si va con sirena, 2.5).
+
+**2.4.7 Verificación.** `tests/traffic-performance.test.cjs` fija el presupuesto de CPU (< 2 ms/frame con 400 coches);
+nuevas pruebas: ningún coche parado > 60 s sin causa (semáforo/cola), densidad por tramo dentro del límite, y una
+prueba de humo de 5 minutos simulados sin interbloqueos en el casco antiguo.
+
+### 2.5 Policía: Mossos y Policia Municipal, con criterio
 
 **Hoy.** 1 de cada 60 coches es policía (librea Policia Municipal), **siempre con sirena** (el audio escribe una
 fuente de sirena para todo coche con `isPolice` a menos de 200 m) y con luces fijas.
 
 **Propuesta.**
 1. Dos cuerpos: **Policia Municipal de Terrassa** (blanco con banda ajedrezada azul/amarilla, cerca del Centre y en
-   el tráfico ordinario) y **Mossos d'Esquadra** (blanco con azul oscuro y rojo, luces azules, más en rondas y
-   accesos). Un tercer vehículo: ambulancia SEM amarilla. Librea = una posición más de `carState.w`.
-2. **Estados**: patrulla (sin sirena ni luces, respeta semáforos), emergencia (luces + sirena bitonal, salta
-   semáforos, los demás se apartan) y parada (aparcado con luces). La emergencia salta aleatoriamente (p. ej. 1 cada
-   4 minutos cerca del jugador) o cuando el jugador conduce temerariamente (opcional, modo juego).
+   el tráfico ordinario) y **Mossos d'Esquadra** (blanco con azul oscuro y franja roja, luces azules, más en rondas y
+   accesos). Un tercer vehículo: ambulancia del SEM amarilla; opcional Bombers rojo. Librea = una posición más de
+   `carState.w`.
+2. **Estados**: patrulla (sin sirena ni luces, respeta semáforos y límites), emergencia (luces + sirena bitonal,
+   salta semáforos, los demás se apartan) y parada (aparcado con luces, agentes de pie). La emergencia salta de
+   forma aleatoria (una cada ~4 minutos cerca del jugador) y se extingue al llegar a un destino.
 3. **Reacción del tráfico**: los coches ceden al vehículo en emergencia (frenan y se arriman al bordillo).
-4. **Sirena bitonal** ya existe en `audio-synthesis.js`; añadir la variante "yelp" en cruces.
+4. **Sirena**: bitonal ya existe en `audio-synthesis.js`; añadir "yelp" en los cruces y silencio en patrulla.
+5. Opcional (modo juego): la Policia Municipal persigue al jugador si atropella o circula por la acera; nivel de
+   búsqueda que baja al esconderse.
 
-**Riesgo.** Bajo: cambia librea, un flag de estado y la lógica que ya existe de `isPolice`.
+### 2.6 Peatones: densidad por lugar y por hora
 
-### 2.5 Peatones
+- **Mapa de atracción**: peso por tramo de acera = base por tipo de calle + comercios cercanos (764 reales, kind
+  bar/tienda pesan más) + equipamientos (estaciones, mercados, escuelas, hospital, universidad, parques, plazas) +
+  densidad de viviendas del Catastro (`dwellings` por manzana, ya en los datos). El casco antiguo y la Rambla deben
+  tener 10× más gente que un polígono.
+- **Curva horaria** (hora del modo de luz + reloj continuo si se implementa 2.8): madrugada casi vacío, 8–9 h
+  escolares y trabajadores, 12–14 h comercios, 17–20 h paseo, noche terrazas; sábados mercado; domingos Vallparadís.
+- **Aparición** proporcional al peso del tramo (muestreo por ruleta), presupuesto global por FPS como hoy, y
+  desaparición al salir de la zona.
+- **Comportamientos**: grupos (2–4 que caminan juntos y hablan, ya hay conversaciones), terrazas (sentados en
+  sillas frente a los bares reales), colas en paradas de bus, gente mirando escaparates, esperar en el bordillo y
+  cruzar por los **pasos de cebra** (ya en datos: 3.971), apartarse del coche en la acera, correr si llueve.
+- **Variedad visual**: edades (niños con adultos, mayores), ropa por estación, bolsas de compra, perros.
 
-Cruzar por pasos de cebra (2.1.9), esperar en la acera cuando viene un coche, más variedad de ropa y edades, grupos
-y terrazas de bar (sentados), colas en paradas de bus. Horarios: calles vacías de madrugada, mercadillo los miércoles
-y sábados en el Mercat/Plaça de la Independència.
+### 2.7 Peatón, bici y helicóptero del jugador
 
-### 2.6 Modos y juego
+Escaleras y rampas con relieve, entrar en el Parc de Vallparadís por sus accesos reales, helicóptero con
+aterrizaje en el Estadi/Mútua y viento; bici con carriles bici reales y aparcabicis.
 
-- **Helicóptero**: ya; añadir **patinete/moto** y **autobús de TMESA conducible** con su línea.
-- **Misiones ligeras**: taxi (recoger/llevar pasajeros a lugares reales), reparto, "visita turística" con puntos de
-  interés narrados (Modernisme, Seu d'Ègara, chimeneas). Da sentido a los monumentos.
-- **Hora y clima**: ciclo diario continuo (hoy 4 presets), lluvia de otoño, calima de verano, luz de poniente real.
+### 2.8 Tiempo, clima y vida
 
-### 2.7 Rendimiento
+- **Reloj continuo** (hoy 4 presets): el sol recorre el cielo (posición real para 41,56° N), luces de los pisos que
+  se encienden al anochecer por viviendas reales, farolas con encendido escalonado, comercios que cierran.
+- **Clima**: lluvia de otoño con charcos y reflejos (ya hay SSR), viento (toldos, árboles), calima de verano,
+  niebla matinal del Vallès.
+- **Sonido**: ambiente por zona (Rambla con terrazas, polígono con naves, Vallparadís con pájaros), campanas de la
+  Catedral a las horas, trenes en la estación.
+
+### 2.9 Rendimiento del motor
 
 112k colisionadores y 110k cajas de fachada: fusionar volúmenes contiguos de igual altura (reduce ambos a la mitad),
-LOD de fachada por distancia (ya existe), streaming de colisionadores por celda, y medir con el arnés + `hud-fps`.
-
----
+LOD de fachada por distancia (ya existe), streaming de colisionadores por celda, tráfico y peatones por celdas de 100 m
+con actualización a menor frecuencia lejos del jugador, y medir con el arnés + `hud-fps` en un recorrido fijo.
 
 ## Eje 3 · Monumentos reconocibles
 
@@ -261,18 +344,23 @@ ya reserva su recinto.
 
 | # | Mejora | Impacto | Esfuerzo | Riesgo | Depende de |
 |---|---|---|---|---|---|
-| 1 | Semáforos con desfase y ciclos por cruce (2.2) | Alto (se nota al minuto) | Bajo | Medio | — |
-| 2 | Policía con estados, Mossos, sirena solo en emergencia (2.4) | Alto | Bajo | Bajo | — |
-| 3 | Pasos de cebra pintados y peatones cruzando por ellos (1.9) | Medio | Bajo | Bajo | — |
-| 4 | Monumentos con fotos: Catedral, Mútua, Masia Freixa, mNACTEC (3) | Alto | Medio | Nulo | fotos |
-| 5 | Física de conducción (2.1) | Alto | Medio | Medio | — |
-| 6 | Tráfico con rutas y autobuses en líneas reales (2.3) | Alto | Medio-alto | Medio | paradas OSM |
-| 7 | Relieve real (1.1) | Muy alto | Alto | Alto | MDE ICGC |
-| 8 | Alturas LiDAR y cubiertas (1.2, 1.3) | Medio-alto | Medio | Bajo | LiDAR/ortofoto ICGC |
-| 9 | Comercios con direcciones (1.5), árboles y farolas reales (1.6) | Medio | Medio | Bajo | datos Ajuntament |
-| 10 | Barrios oficiales (1.4), calzadas ICGC (1.7), parques (1.8) | Medio | Medio | Bajo-medio | datos |
-| 11 | Mobiliario terrassenc (1.10), peatones (2.5), misiones (2.6) | Medio | Variable | Bajo | — |
-| 12 | Rendimiento: fusión de volúmenes, streaming de colisionadores (2.7) | Medio | Medio | Medio | — |
+| 1 | Colisiones con árboles, farolas y props; respuesta de choque (2.1.1) | Alto | Bajo | Bajo | — |
+| 2 | Semáforos con desfase y ciclos por cruce (2.3) | Alto (se nota al minuto) | Bajo | Medio | — |
+| 3 | Aparición equilibrada de coches y peatones por tramo, zona y hora (2.4.1, 2.6) | Alto | Bajo-medio | Bajo | — |
+| 4 | Policía con estados, Mossos, sirena solo en emergencia (2.5) | Alto | Bajo | Bajo | — |
+| 5 | Seguimiento IDM, interbloqueos, rotondas, velocidades por vía (2.4.3, 2.4.4) | Alto | Medio | Medio | — |
+| 6 | Física de conducción arcade cuidada (2.1.2) | Alto | Medio | Medio | — |
+| 7 | Pasos de cebra pintados y peatones cruzando por ellos (1.9) | Medio | Bajo | Bajo | — |
+| 8 | Monumentos con fotos: Catedral, Mútua, Masia Freixa, mNACTEC (3) | Alto | Medio | Nulo | fotos |
+| 9 | Tráfico con destinos y rutas; autobuses de TMESA por sus líneas (2.4.2, 2.4.6) | Alto | Medio-alto | Medio | paradas OSM |
+| 10 | Relieve real (1.1) | Muy alto | Alto | Alto | MDE ICGC |
+| 11 | Alturas LiDAR y cubiertas (1.2, 1.3) | Medio-alto | Medio | Bajo | LiDAR/ortofoto ICGC |
+| 12 | Comercios con direcciones (1.5), árboles y farolas reales (1.6) | Medio | Medio | Bajo | datos Ajuntament |
+| 13 | Barrios oficiales (1.4), calzadas ICGC (1.7), parques (1.8) | Medio | Medio | Bajo-medio | datos |
+| 14 | Reloj continuo, clima, aparcamientos en calzada, mobiliario terrassenc (2.8, 2.2, 1.10) | Medio | Variable | Bajo | — |
+| 15 | Rendimiento: fusión de volúmenes, streaming de colisionadores (2.9) | Medio | Medio | Medio | — |
 
-Recomendación de arranque: **1 + 2 + 3** en una sesión (todo en `traffic.js`/`road-network.js`/`street-details.js`,
-bajo riesgo, muy perceptible), después **4** con fotos, y en paralelo preparar los datos de **7** y **8**.
+Recomendación de arranque: **1 + 2 + 3 + 4** en una sesión (colisiones, semáforos, aparición equilibrada, policía:
+todo en `controllers.js`/`traffic.js`/`road-network.js`/`street-details.js`, bajo riesgo y muy perceptible), luego
+**5 + 6** (comportamiento de los coches y física), después **8** con fotos, y en paralelo preparar los datos de
+**10** y **11**.
