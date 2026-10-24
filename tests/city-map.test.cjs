@@ -4,16 +4,35 @@ const { join } = require('node:path');
 const test = require('node:test');
 const { loadModule } = require('./helpers/module.cjs');
 
-const source = readFileSync(join(__dirname, '../js/nyc-map.js'), 'utf8');
+const source = readFileSync(join(__dirname, '../js/city-map.js'), 'utf8');
+
+// The city data the map draws, empty: the harnesses exercise the viewport & input state, not the geographic layers
+function cityConfigStub(overrides = {}) {
+  return {
+    ROADS: [], STREET_INDEX: [], BLOCKS: [], PARKS: [], LANDUSE: [], WATERWAYS: [], RAIL_LINES: [],
+    MUNICIPALITY_RINGS: [], MUNICIPALITIES: [], LAND_RING: [],
+    WORLD_BOUNDS: { minX: -10000, maxX: 10000, minZ: -10000, maxZ: 10000 },
+    DISTRICTS: [], SQUARES: [], CITY_LANDMARKS: [], LANDMARK_SITES: {}, MODELLED_LANDMARKS: [],
+    SPAWN: { x: 0, z: 0, heading: Math.PI },
+    LAND_CLASS: { NONE: 0, PARK: 1, SPORTS: 2, WOOD: 3, SCRUB: 4, FARM: 5, INDUSTRIAL: 6, CEMETERY: 7, RAILWAY: 8, PARKING: 9, WATER: 10, CAMPUS: 11, PLAZA: 12, GRASS: 13 },
+    UNNAMED: 'Carrer sense nom',
+    getIslandBoundsAtZ: () => ({ westX: -10000, eastX: 10000 }),
+    getLocationLabel: (x, z) => `${x}, ${z}`,
+    isTypingInField: () => false,
+    ...overrides
+  };
+}
+const geodataStub = { GEO: { city: 'Terrassa', frame: { bearingDeg: -13.7 } } };
+const plain = (value) => JSON.parse(JSON.stringify(value));
 
 for (const [width, height, dpr] of [[500, 300, 1], [320, 180, 1.5], [1920, 1080, 2]]) {
   test(`map clicks match rendered world positions at ${width}x${height}, DPR ${dpr}`, () => {
     const window = { innerWidth: width, innerHeight: height, devicePixelRatio: dpr };
-    const { NYCMapSystem } = loadModule(source, {
+    const { CityMapSystem } = loadModule(source, {
       globals: { window, performance: { now: () => 0 } },
-      imports: { './nyc-geodata.js': { GEO: {} }, './city-config.js': { ROADS: [] } }
+      imports: { './terrassa-geodata.js': { GEO: {} }, './city-config.js': { ROADS: [] } }
     });
-    const map = Object.create(NYCMapSystem.prototype);
+    const map = Object.create(CityMapSystem.prototype);
     // Capture the production render viewport; drawing primitives are irrelevant to coordinate conversion.
     const context = new Proxy({}, { get: () => () => {} });
     let view;
@@ -67,7 +86,7 @@ function classList() {
   };
 }
 
-function mapHarness() {
+function mapHarness(configOverrides = {}) {
   const window = { ...eventTarget(), innerWidth: 200, innerHeight: 200 };
   const canvas = {
     ...eventTarget(), style: {}, clientWidth: 200, clientHeight: 200,
@@ -77,10 +96,12 @@ function mapHarness() {
   const controls = eventTarget();
   const wrapper = { classList: classList() };
   const zoomIn = eventTarget(), zoomOut = eventTarget();
+  const needle = { transform: '', setAttribute(name, value) { this[name] = value; } };
   const elements = {
     'fullmap-canvas': canvas, 'fullmap-canvas-wrap': wrapper,
     'fullmap-modal': { classList: classList() },
-    'map-zoom-in': zoomIn, 'map-zoom-out': zoomOut
+    'map-zoom-in': zoomIn, 'map-zoom-out': zoomOut,
+    'map-compass-needle': needle
   };
   const document = {
     ...eventTarget(), hidden: false,
@@ -94,19 +115,12 @@ function mapHarness() {
     captured.delete(id);
     canvas.dispatch('lostpointercapture', { pointerId: id });
   };
-  const config = {
-    ROADS: [], BLOCKS: [], NYC_LANDMARKS: [],
-    ISLAND_BOUNDS: { minX: -10000, maxX: 10000, minZ: -10000, maxZ: 10000 },
-    getIslandBoundsAtZ: () => ({ westX: -10000, eastX: 10000 }),
-    getLocationLabel: (x, z) => `${x}, ${z}`,
-    isTypingInField: () => false
-  };
-  const { NYCMapSystem } = loadModule(source, {
+  const { CityMapSystem } = loadModule(source, {
     globals: { window, document },
-    imports: { './nyc-geodata.js': { GEO: { frame: {} } }, './city-config.js': config }
+    imports: { './terrassa-geodata.js': geodataStub, './city-config.js': cityConfigStub(configOverrides) }
   });
   const teleports = [], toggles = [];
-  const map = new NYCMapSystem({
+  const map = new CityMapSystem({
     controllerManager: { getActiveEntity: () => ({ position: { x: 1000, z: 2000 } }) },
     onTeleport: (x, z) => teleports.push([x, z]),
     onToggle: (open) => toggles.push(open)
@@ -116,7 +130,7 @@ function mapHarness() {
   map.viewZoom = 1;
   map.toggleFullMap(true);
   return {
-    map, canvas, controls, wrapper, window, document, captured, teleports, toggles, zoomIn, zoomOut,
+    map, canvas, controls, wrapper, window, document, captured, teleports, toggles, zoomIn, zoomOut, needle,
     pointer(target, type, id, x = 110, y = 120, pointerType = 'touch', button = 0) {
       const event = { pointerId: id, clientX: x, clientY: y, pointerType, button, preventDefault() {} };
       (captured.has(id) ? canvas : target).dispatch(type, event);
@@ -203,4 +217,22 @@ test('mouse hover and zoom buttons remain available without a pan', () => {
   assert.equal(h.map.viewZoom, 1.45);
   h.zoomOut.dispatch('click');
   assert.equal(h.map.viewZoom, 1);
+});
+
+test('the default waypoint is the Plaça Vella and the compass needle leans 13.7° east of grid north', () => {
+  const h = mapHarness({ CITY_LANDMARKS: [{ id: 'placavella', name: 'Plaça Vella', short: 'Plaça Vella', x: 0, z: 0 }] });
+  // objects built inside the module's vm context have their own Object prototype: compare plain values
+  assert.deepEqual(plain(h.map.waypoint), { x: 0, z: 0, name: 'Plaça Vella' });
+  // The map is drawn grid north up; the grid leans 13.7° west of true north, so true north is 13.7° to the right
+  assert.equal(h.needle.transform, 'rotate(13.7 22 22)');
+});
+
+test('map teleports are clamped to the world bounds and the land edges', () => {
+  const h = mapHarness({
+    WORLD_BOUNDS: { minX: -1000, maxX: 1000, minZ: -2000, maxZ: 2000 },
+    getIslandBoundsAtZ: () => ({ westX: -500, eastX: 500 })
+  });
+  assert.deepEqual(plain(h.map.clampToWorld({ x: 900, z: 3000 })), { x: 488, z: 1975 });
+  assert.deepEqual(plain(h.map.clampToWorld({ x: -5000, z: -5000 })), { x: -488, z: -1975 });
+  assert.deepEqual(plain(h.map.clampToWorld({ x: 100, z: 200 })), { x: 100, z: 200 });
 });

@@ -1,6 +1,16 @@
-[out:json][timeout:120];
+[out:json][timeout:240];
+// Named buildings & sites of Terrassa: monuments, churches, museums, stations, markets, theatres, civic buildings,
+// and the named squares & neighbourhoods (place nodes) for the districts
 (
-  way["building"]["name"~"^(Empire State Building|Chrysler Building|One Vanderbilt|Grand Central Terminal|MetLife Building|New York Public Library|Stephen A. Schwarzman Building|One Times Square|30 Rockefeller Plaza|Comcast Building|Citigroup Center|601 Lexington Avenue|Seagram Building|Flatiron Building|One World Trade Center|New York Stock Exchange|Federal Hall|Bank of America Tower|Rockefeller Center|General Electric Building|Woolworth Building|Madison Square Garden|Pennsylvania Station|Plaza Hotel|The Plaza|Trump Tower|Central Park Tower|432 Park Avenue|Hearst Tower|One57|Brookfield Place|Oculus|Three World Trade Center|Two World Trade Center|Four World Trade Center|7 World Trade Center|Metropolitan Museum of Art|American Museum of Natural History|Guggenheim Museum|Solomon R. Guggenheim Museum|United Nations Secretariat Building|Dakota|The Dakota|San Remo|Lincoln Center|Metropolitan Opera House|Carnegie Hall|St. Patrick's Cathedral|Radio City Music Hall|Macy's|Port Authority Bus Terminal|Javits Center|Jacob K. Javits Convention Center|The Vessel|Vessel|30 Hudson Yards|35 Hudson Yards|10 Hudson Yards|20 Hudson Yards|The Shed|Edge)$"](40.69,-74.03,40.80,-73.93);
-  relation["building"]["name"~"^(Empire State Building|Chrysler Building|Grand Central Terminal|New York Public Library|Stephen A. Schwarzman Building|Rockefeller Center|Metropolitan Museum of Art|American Museum of Natural History|Madison Square Garden|Pennsylvania Station|Brookfield Place|Port Authority Bus Terminal|Jacob K. Javits Convention Center|Macy's|Flatiron Building|One World Trade Center|Seagram Building)$"](40.69,-74.03,40.80,-73.93);
+  way["building"]["name"](41.538,1.972,41.608,2.052);
+  relation["building"]["name"](41.538,1.972,41.608,2.052);
+  nwr["historic"]["name"](41.538,1.972,41.608,2.052);
+  nwr["tourism"~"^(attraction|museum|artwork|viewpoint)$"]["name"](41.538,1.972,41.608,2.052);
+  nwr["amenity"~"^(place_of_worship|townhall|theatre|marketplace|hospital|university|library|cinema|arts_centre|community_centre)$"]["name"](41.538,1.972,41.608,2.052);
+  nwr["railway"="station"]["name"](41.538,1.972,41.608,2.052);
+  nwr["man_made"~"^(tower|chimney|water_tower)$"](41.538,1.972,41.608,2.052);
+  nwr["leisure"~"^(park|garden|stadium|sports_centre)$"]["name"](41.538,1.972,41.608,2.052);
+  node["place"~"^(suburb|quarter|neighbourhood|square)$"](41.538,1.972,41.608,2.052);
+  way["place"="square"]["name"](41.538,1.972,41.608,2.052);
 );
-out geom tags;
+out geom;

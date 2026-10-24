@@ -1,23 +1,97 @@
 import * as THREE from 'three/webgpu';
-import { bryantParkLawn } from './landmarks.js';
+import { CITY_LANDMARKS, LANDMARK_SITES, TELEPORT_LOCATIONS, SPAWN, STREET_INDEX, PARKS, pointInPoly } from './city-config.js';
 
 // js/cameras.js
 // Multi-camera system supporting Third-Person Chase (with mouse/touch orbit + zoom),
-// Low-Angle Action Cam, POV/Cockpit Cam, 7 Iconic NYC Architectural Cameras, and Auto-Director Drone.
+// Low-Angle Action Cam, POV/Cockpit Cam, 7 Scenic Terrassa Cameras, and Auto-Director Drone.
 
 const CAMERA_PRESETS = [
-  { id: 'chase',       name: '3rd-Person Chase',         short: 'Chase',       category: 'follow', fov: 56 },
-  { id: 'action',      name: 'Low-Angle Action',         short: 'Action',      category: 'follow', fov: 60 },
-  { id: 'pov',         name: 'First-Person / Cockpit',   short: 'POV / Dash',  category: 'follow', fov: 68 },
-  { id: 'centralPark', name: 'Central Park Oasis',       short: 'Central Pk',  category: 'scenic', fov: 52 },
-  { id: 'fifthAve',    name: '5th Ave & Empire State',   short: '5th Ave',     category: 'scenic', fov: 48 },
-  { id: 'timesSquare', name: 'Times Square Crossroads',  short: 'Times Sq',    category: 'scenic', fov: 58 },
-  { id: 'chryslerGCT', name: '42nd St · Chrysler & GCT', short: 'Chrysler',    category: 'scenic', fov: 50 },
-  { id: 'observatory', name: 'Empire State 86th Deck',   short: '86th Deck',   category: 'scenic', fov: 52 },
-  { id: 'bryantPark',  name: 'Bryant Park & NYPL',       short: 'Bryant Pk',   category: 'scenic', fov: 52 },
-  { id: 'waterfront',  name: 'East River & Skyline',     short: 'Skyline',     category: 'scenic', fov: 46 },
-  { id: 'drone',       name: 'Auto-Director Aerial',     short: 'Director',    category: 'scenic', fov: 50 }
+  { id: 'chase',       name: '3rd-Person Chase',                 short: 'Chase',       category: 'follow', fov: 56 },
+  { id: 'action',      name: 'Low-Angle Action',                 short: 'Action',      category: 'follow', fov: 60 },
+  { id: 'pov',         name: 'First-Person / Cockpit',           short: 'POV / Dash',  category: 'follow', fov: 68 },
+  { id: 'placaVella',  name: 'Plaça Vella & Catedral',           short: 'Plaça Vella', category: 'scenic', fov: 58 },
+  { id: 'masiaFreixa', name: 'Masia Freixa · Parc de Sant Jordi', short: 'Masia Freixa', category: 'scenic', fov: 50 },
+  { id: 'rambla',      name: 'Rambla d\'Ègara & mNACTEC',        short: 'Rambla',      category: 'scenic', fov: 48 },
+  { id: 'vallparadis', name: 'Vallparadís & Castell Cartoixa',   short: 'Vallparadís', category: 'scenic', fov: 52 },
+  { id: 'mutua',       name: 'Mútua Tower Rooftop · 70 m',       short: 'Mútua',       category: 'scenic', fov: 52 },
+  { id: 'estadi',      name: 'Estadi Olímpic',                   short: 'Estadi',      category: 'scenic', fov: 50 },
+  { id: 'skyline',     name: 'Skyline & La Mola',                short: 'Skyline',     category: 'scenic', fov: 46 },
+  { id: 'drone',       name: 'Auto-Director Aerial',             short: 'Director',    category: 'scenic', fov: 50 }
 ];
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Scenic vantage points, looked up by id / name in the city data at module load (never hard-coded coordinates): the
+// landmarks' real OpenStreetMap centres & sizes (CITY_LANDMARKS / LANDMARK_SITES), the parks' outlines, the street
+// index and the teleport arrivals. Every spot falls back to the Plaça Vella (the world origin) when its data is absent.
+// ---------------------------------------------------------------------------------------------------------------------
+const ORIGIN = { x: 0, z: 0 };
+const landmarks = Array.isArray(CITY_LANDMARKS) ? CITY_LANDMARKS : [];
+const sites = LANDMARK_SITES || {};
+const landmark = (id) => landmarks.find((l) => l.id === id) || null;
+const site = (name) => sites[name] || null;
+const park = (name) => (Array.isArray(PARKS) ? PARKS.find((p) => p.name === name) : null) || null;
+const street = (name) => (Array.isArray(STREET_INDEX) ? STREET_INDEX.find((e) => e.name === name) : null) || null;
+const teleport = (key) => (TELEPORT_LOCATIONS && TELEPORT_LOCATIONS[key]) || null;
+const pointOf = (p, fallback = ORIGIN) => (p && Number.isFinite(p.x) && Number.isFinite(p.z) ? { x: p.x, z: p.z } : { x: fallback.x, z: fallback.z });
+function centroidOf(ring) {
+  if (!ring || !ring.length) return null;
+  let x = 0, z = 0;
+  for (const p of ring) { x += p.x; z += p.z; }
+  return { x: x / ring.length, z: z / ring.length };
+}
+// A point `dist` metres from `from` toward `to` (or along +z when both coincide)
+function towards(from, to, dist) {
+  const dx = to.x - from.x, dz = to.z - from.z;
+  const L = Math.hypot(dx, dz) || 1;
+  return { x: from.x + (dx / L) * dist, z: from.z + (dz / L) * dist };
+}
+
+const spawn = pointOf(SPAWN);
+const placaVella = pointOf(landmark('placavella'));
+const catedral = pointOf(landmark('catedral'), { x: placaVella.x + 70, z: placaVella.z });
+const masia = pointOf(landmark('masiafreixa'));
+const santJordiPark = park('Parc de Sant Jordi');
+const santJordi = pointOf(santJordiPark ? centroidOf(santJordiPark.rings[0]) : landmark('santjordi'), { x: masia.x - 60, z: masia.z + 20 });
+// The Rambla d'Ègara runs north-south past the mNACTEC (the Vapor Aymerich, Amat i Jover) and the Mercat
+const mnactec = landmark('mnactec') || teleport('rambla') || landmark('mercat') || street('Rambla d\'Ègara');
+const rambla = pointOf(mnactec, { x: placaVella.x - 200, z: placaVella.z - 200 });
+const cartoixa = pointOf(landmark('cartoixa'));
+// A spot inside the Parc de Vallparadís (the torrent is a narrow valley west of the castle) with the castle in view: the
+// first point around the castle that the park's real outline contains, west first
+const vallparadisPark = park('Parc de Vallparadís');
+const insidePark = (p, pt) => !!(p && p.rings && p.rings[0] && typeof pointInPoly === 'function' && pointInPoly(p.rings[0], pt.x, pt.z));
+const vallparadis = (() => {
+  for (const d of [110, 80, 150, 200]) {
+    for (const a of [1, 1.25, 0.75, 1.5, 0.5]) { // turns of PI: west, south-west, north-west, south, north
+      const pt = { x: cartoixa.x + Math.cos(a * Math.PI) * d, z: cartoixa.z + Math.sin(a * Math.PI) * d };
+      if (insidePark(vallparadisPark, pt)) return pt;
+    }
+  }
+  return towards(cartoixa, pointOf(landmark('vallparadis'), { x: cartoixa.x - 60, z: cartoixa.z + 300 }), 150);
+})();
+const mutua = landmark('mutua');
+const mutuaTop = { ...pointOf(mutua), y: (mutua && mutua.site && mutua.site.h) || 70 };
+const estadiSite = site('Estadi Municipal Olímpic') || (landmark('estadi') || {}).site || null;
+const estadi = { ...pointOf(landmark('estadi')), w: (estadiSite && estadiSite.w) || 150, d: (estadiSite && estadiSite.d) || 180 };
+
+const SCENIC = {
+  // Low in the square, by its west side, looking east at the Catedral del Sant Esperit over the terraces
+  placaVella: { pos: { ...towards(placaVella, catedral, -24), y: 2.2 }, look: { ...catedral, y: 15 } },
+  // From the lawn of the Parc de Sant Jordi toward the Masia Freixa (Lluís Muncunill's modernista masia)
+  masiaFreixa: { pos: { ...towards(masia, santJordi, 78), y: 1.7 }, look: { ...masia, y: 8 } },
+  // On the Rambla d'Ègara south of the mNACTEC, looking north up the Rambla toward the vapor's chimney
+  rambla: { pos: { x: rambla.x, y: 4.5, z: rambla.z + 170 }, look: { x: rambla.x, y: 14, z: rambla.z - 120 } },
+  // Inside the Parc de Vallparadís (the torrent), looking up at the Castell Cartoixa on its edge
+  vallparadis: { pos: { ...vallparadis, y: 1.8 }, look: { ...cartoixa, y: 12 } },
+  // The roof of the Hospital Universitari Mútua Terrassa tower (17 floors, 70 m), panning over the centre
+  mutua: { pos: { x: mutuaTop.x, y: mutuaTop.y + 4, z: mutuaTop.z }, look: { ...catedral, y: 28 } },
+  // Above the south-east stand of the Estadi Olímpic, looking down onto the pitch
+  estadi: { pos: { x: estadi.x + estadi.w * 0.7, y: 26, z: estadi.z + estadi.d * 0.7 }, look: { x: estadi.x, y: 2, z: estadi.z } },
+  // Aerial from south of the centre looking north (-z) over the rooftops toward La Mola & Sant Llorenç del Munt
+  skyline: { pos: { x: spawn.x - 220, y: 150, z: spawn.z + 1300 }, look: { x: spawn.x, y: 60, z: spawn.z - 2600 } },
+  // The auto-director orbits the centre, between the Plaça Vella and the Mútua tower
+  drone: { center: { x: (placaVella.x + mutuaTop.x) * 0.5, y: 120, z: (placaVella.z + mutuaTop.z) * 0.5 } }
+};
 
 class CameraSystem {
   constructor(domElement, controllerManager) {
@@ -28,7 +102,7 @@ class CameraSystem {
       56,
       window.innerWidth / window.innerHeight,
       0.35,
-      60000 // at 1:1 the boroughs & harbor run out ~20-40 km to the fogged horizon (reversed float depth keeps precision)
+      60000 // at 1:1 the Vallès and the Serra de l'Obac run out ~20-40 km to the fogged horizon (reversed float depth keeps precision)
     );
 
     this.activePresetId = 'chase';
@@ -38,8 +112,9 @@ class CameraSystem {
     this.isDragging = false;
     this.userOrbitTimer = 0;
 
-    this.currentPos = new THREE.Vector3(0, 10, 380);
-    this.currentLookAt = new THREE.Vector3(0, 8, 440);
+    // Start just behind the spawn (on the street by the Plaça Vella), looking at it
+    this.currentPos = new THREE.Vector3(spawn.x, 10, spawn.z + 60);
+    this.currentLookAt = new THREE.Vector3(spawn.x, 8, spawn.z);
     this.initialized = false;
 
     // Follow cameras (chase / action) are smoothed relative to the followed entity, see update()
@@ -255,74 +330,80 @@ class CameraSystem {
         break;
       }
 
-      case 'centralPark': {
-        // Inside Central Park South looking across The Pond, Gapstow Bridge, The Mall, Sheep Meadow & UWS/UES Skylines
-        const sway = Math.sin(elapsed * 0.22) * 3.5;
-        desiredPos.set(-70.0 + sway, 14.0, -1425.0);
-        desiredLook.set(-250.0, 6.5, -1690.0);
-        break;
-      }
-
-      case 'fifthAve': {
-        // 5th Avenue & 42nd St looking South down the 5th Ave canyon toward the Empire State Building
+      case 'placaVella': {
+        // Low in the Plaça Vella, looking east at the Catedral del Sant Esperit's façade & bell tower
+        const { pos, look } = SCENIC.placaVella;
         const sway = Math.sin(elapsed * 0.25) * 1.8;
-        desiredPos.set(0.0 + sway, 6.5, -20.0);
-        desiredLook.set(-60.0, 150.0, 686.0);
+        desiredPos.set(pos.x, pos.y, pos.z + sway);
+        desiredLook.set(look.x, look.y, look.z);
         break;
       }
 
-      case 'timesSquare': {
-        // Times Square & Broadway looking across Duffy Square red steps and One Times Square billboards
-        const sway = Math.sin(elapsed * 0.3) * 3.0;
-        desiredPos.set(-603.0 + sway, 5.5, -290.0);
-        desiredLook.set(-566.0, 40.0, -40.0);
+      case 'masiaFreixa': {
+        // On the lawn of the Parc de Sant Jordi, looking at the Masia Freixa's arcades & minaret
+        const { pos, look } = SCENIC.masiaFreixa;
+        const sway = Math.sin(elapsed * 0.22) * 2.5;
+        desiredPos.set(pos.x + sway, pos.y, pos.z);
+        desiredLook.set(look.x, look.y, look.z);
         break;
       }
 
-      case 'chryslerGCT': {
-        // Park Ave & 42nd St intersection looking straight at Grand Central, MetLife, and Chrysler Building Crown
+      case 'rambla': {
+        // On the Rambla d'Ègara looking north up its planted median toward the mNACTEC (Vapor Aymerich, Amat i Jover)
+        const { pos, look } = SCENIC.rambla;
+        const sway = Math.sin(elapsed * 0.3) * 2.0;
+        desiredPos.set(pos.x + sway, pos.y, pos.z);
+        desiredLook.set(look.x, look.y, look.z);
+        break;
+      }
+
+      case 'vallparadis': {
+        // In the Parc de Vallparadís looking up at the Castell Cartoixa on the edge of the torrent
+        const { pos, look } = SCENIC.vallparadis;
         const sway = Math.cos(elapsed * 0.22) * 2.5;
-        desiredPos.set(300.0 + sway, 9.5, 95.0);
-        desiredLook.set(470.0, 120.0, -50.0);
+        desiredPos.set(pos.x + sway, pos.y, pos.z);
+        desiredLook.set(look.x, look.y, look.z);
         break;
       }
 
-      case 'observatory': {
-        // Empire State Building 86th Floor Deck looking North-East across Midtown skyline
-        const pan = Math.sin(elapsed * 0.18) * 80.0;
-        desiredPos.set(-58.0, 322.0, 660.0);
-        desiredLook.set(420.0 + pan, 150.0, -200.0);
+      case 'mutua': {
+        // The roof of the Hospital Mútua tower (70 m), panning across the old town & the Catedral
+        const { pos, look } = SCENIC.mutua;
+        const pan = Math.sin(elapsed * 0.18) * 120.0;
+        desiredPos.set(pos.x, pos.y, pos.z);
+        desiredLook.set(look.x, look.y, look.z + pan);
         break;
       }
 
-      case 'bryantPark': {
-        // Inside Bryant Park Great Lawn looking East toward NYPL portico, One Vanderbilt & Chrysler Building
-        const sway = Math.sin(elapsed * 0.25) * 1.5;
-        const lawn = bryantParkLawn || { minX: -260, maxX: -150, minZ: 40, maxZ: 120, top: 1.3 };
-        const lz = (lawn.minZ + lawn.maxZ) * 0.5;
-        desiredPos.set(lawn.minX + 18.0, lawn.top + 1.7, lz + sway);
-        desiredLook.set(lawn.maxX + 260.0, 70.0, lz - 60.0);
+      case 'estadi': {
+        // Above the stands of the Estadi Olímpic (the 1992 Olympic hockey stadium), drifting along the touchline
+        const { pos, look } = SCENIC.estadi;
+        const drift = Math.sin(elapsed * 0.15) * 30.0;
+        desiredPos.set(pos.x, pos.y, pos.z + drift);
+        desiredLook.set(look.x, look.y, look.z);
         break;
       }
 
-      case 'waterfront': {
-        // Over the shimmering East River looking across the FDR Drive, Queensboro Bridge & Midtown Skyline
+      case 'skyline': {
+        // High over the south of the centre, looking north across the rooftops to La Mola & Sant Llorenç del Munt
+        const { pos, look } = SCENIC.skyline;
         const drift = Math.sin(elapsed * 0.15) * 40.0;
-        desiredPos.set(1640.0, 60.0, 60.0 + drift);
-        desiredLook.set(150.0, 150.0, -150.0);
+        desiredPos.set(pos.x + drift, pos.y, pos.z);
+        desiredLook.set(look.x, look.y, look.z);
         break;
       }
 
       case 'drone': {
+        const { center } = SCENIC.drone;
         const angle = elapsed * 0.07 + 0.65;
-        const radius = 720.0 + Math.sin(elapsed * 0.23) * 140.0;
-        const alt = 330.0 + Math.cos(elapsed * 0.19) * 90.0;
+        const radius = 620.0 + Math.sin(elapsed * 0.23) * 120.0;
+        const alt = 260.0 + Math.cos(elapsed * 0.19) * 70.0;
         desiredPos.set(
-          Math.cos(angle) * radius + 60.0,
+          Math.cos(angle) * radius + center.x,
           alt,
-          Math.sin(angle) * radius + 250.0
+          Math.sin(angle) * radius + center.z
         );
-        desiredLook.set(60.0, 160.0, 250.0);
+        desiredLook.set(center.x, center.y, center.z);
         break;
       }
     }

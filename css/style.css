@@ -1,6 +1,6 @@
 /* css/style.css */
-/* NYC HUD design system: quiet graphite glass in the corners of the screen, taxi yellow for whatever is active,
-   NYC DOT green for street names, so that the city itself stays the star */
+/* Terrassa HUD design system: quiet graphite glass in the corners of the screen, Terrassa red (the city's colour)
+   for whatever is active, Catalan cream & blue plaques for street names, so that the city itself stays the star */
 
 :root {
   /* Surfaces */
@@ -18,10 +18,13 @@
   --text-3: rgba(246, 245, 242, 0.44);
 
   /* Accents */
-  --taxi: #ffc21a;
-  --taxi-ink: #17140a;
-  --sign-green: #0b6a46;
-  --highway: #c08a3e;
+  --taxi: #c8102e; /* the accent (kept under the original's name): Terrassa red */
+  --taxi-ink: #fff4f2;
+  --sign-paper: #f3eee2; /* Catalan street plaque: cream ground, dark blue lettering & border */
+  --sign-ink: #1e3a70;
+  --highway: #c98a3a;
+  --park: #3f8a57;
+  --river: #3b85b8;
   --ok: #5ee08f;
   --warn: #ffc857;
   --bad: #ff7a6b;
@@ -35,7 +38,7 @@
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
 
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
-  --font-sign: 'Overpass', 'Inter', 'Helvetica Neue', Arial, sans-serif;
+  --font-sign: 'Inter', 'Helvetica Neue', Arial, sans-serif;
 }
 
 * {
@@ -191,7 +194,7 @@ body::after {
   animation: rise-in 0.8s var(--ease-out) both;
 }
 
-.mta-bullet.loader-bullet {
+.city-badge.loader-badge {
   width: 56px;
   height: 56px;
   margin-bottom: 22px;
@@ -333,15 +336,16 @@ body.hud-minimized .toolbar > :not(#btn-toggle-hud) {
   padding: 0 18px 0 9px;
 }
 
-.mta-bullet {
+/* The city badge: a round Terrassa-red disc with a white T (a simple device, not the municipal coat of arms) */
+.city-badge {
   width: 30px;
   height: 30px;
   border-radius: 50%;
   background: var(--taxi);
-  color: var(--taxi-ink);
+  color: #ffffff;
   font-weight: 800;
-  font-size: 12.5px;
-  letter-spacing: -0.02em;
+  font-size: 14px;
+  letter-spacing: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -623,7 +627,7 @@ body.hud-minimized .icon-show {
 }
 
 /* ------------------------------------------------------------------------------------------------------------------
-   Bottom left: NYC street-name signs over the GPS radar
+   Bottom left: Catalan street-name plaques over the GPS radar
    ------------------------------------------------------------------------------------------------------------------ */
 .location {
   display: flex;
@@ -663,23 +667,23 @@ body.hud-minimized .icon-show {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
 }
 
-/* Green blade, white inset border, Highway Gothic lettering: the sign on every Manhattan corner */
+/* Cream plaque, dark blue lettering & thin blue border: the ceramic / enamel street plaque on every Catalan corner */
 .street-sign {
-  max-width: 210px;
+  max-width: 230px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  padding: 9px 13px 7px;
+  padding: 8px 13px 7px;
   font-family: var(--font-sign);
-  font-size: 15px;
-  font-weight: 700;
+  font-size: 14.5px;
+  font-weight: 650;
   line-height: 1.05;
-  letter-spacing: 0.01em;
-  color: #ffffff;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0) 55%), var(--sign-green);
-  border-radius: 6px;
-  outline: 1.5px solid rgba(255, 255, 255, 0.92);
-  outline-offset: -4px;
+  letter-spacing: 0.005em;
+  color: var(--sign-ink);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.35), rgba(255, 255, 255, 0) 60%), var(--sign-paper);
+  border-radius: 3px;
+  outline: 1.5px solid var(--sign-ink);
+  outline-offset: -3px;
   box-shadow: 0 1px 0 rgba(0, 0, 0, 0.35), 0 10px 22px -10px rgba(0, 0, 0, 0.75);
 }
 
@@ -689,7 +693,7 @@ body.hud-minimized .icon-show {
   height: 184px;
   overflow: hidden;
   border-radius: 18px;
-  background: #0a1118;
+  background: #141a18; /* MAP.base in js/city-map.js */
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
   cursor: pointer;
@@ -793,7 +797,7 @@ body.hud-minimized .icon-show {
   padding: 5px;
 }
 
-/* The taxi-yellow pill glides to the selected mode (positioned by main.js) */
+/* The red pill glides to the selected mode (positioned by main.js) */
 .mode-indicator {
   position: absolute;
   z-index: 0;
@@ -940,7 +944,7 @@ body[data-mode='helicopter'] .gauge-alt {
   overflow: hidden;
 }
 
-/* Speed as a share of the mode's top speed; it turns taxi yellow on boost */
+/* Speed as a share of the mode's top speed; it turns red on boost */
 #hud-speed-meter {
   position: absolute;
   inset: 0;
@@ -1240,14 +1244,24 @@ body.is-boosting #hud-speed-meter {
 }
 
 .gps-swatch,
-.bridge-swatch {
+.highway-swatch,
+.river-swatch {
   width: 16px;
   height: 4px;
   border-radius: 2px;
 }
 
 .gps-swatch { background: var(--taxi); }
-.bridge-swatch { background: var(--highway); }
+.highway-swatch { background: var(--highway); }
+.river-swatch { background: var(--river); }
+
+.park-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: #1f3b27;
+  box-shadow: inset 0 0 0 1px var(--park);
+}
 
 .legend-counts {
   padding-left: 14px;
@@ -1282,7 +1296,7 @@ body.is-boosting #hud-speed-meter {
 @media (max-width: 820px) {
   :root { --edge: 12px; }
   .hud-top-left { top: calc(max(var(--edge), env(safe-area-inset-top)) + 62px); }
-  .brand > .mta-bullet,
+  .brand > .city-badge,
   .brand-heading h1,
   .brand-subtitle { display: none; }
   .brand { height: 44px; padding: 0 12px; }
@@ -1401,7 +1415,7 @@ body.is-boosting #hud-speed-meter {
   touch-action: none;
 }
 .touch-action > [aria-hidden] { font-size: 23px; line-height: 1; }
-.touch-boost { grid-column: 2; border-color: rgba(255, 194, 26, 0.65); color: var(--taxi); }
+.touch-boost { grid-column: 2; border-color: rgba(200, 16, 46, 0.65); color: #ff6b7d; }
 .touch-action.is-pressed { color: var(--taxi-ink); background: var(--taxi); border-color: var(--taxi); }
 
 body.touch-enabled .controls-hint,

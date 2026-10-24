@@ -1,7 +1,8 @@
 import * as THREE from 'three/webgpu';
+import { attribute, texture, uv, vec2 } from 'three/tsl';
 import { buildRoadNetwork } from './road-network.js';
 import { createPedestrianRoutes } from './pedestrian-routes.js';
-import { signalPhase, walkSignal, blockAt } from './city-config.js';
+import { signalPhase, walkSignal, blockAt, WORLD_BOUNDS } from './city-config.js';
 import { cityUniforms, createContactShadowMaterial, createCarFlareMaterial } from './tsl-materials.js';
 import { HEADLIGHTS, createVehicleHeadlight, placeVehicleHeadlight } from './vehicle-lights.js';
 import {
@@ -22,8 +23,8 @@ import {
 import { PersonCrowd, PersonRig } from './pedestrians.js';
 
 // js/traffic.js
-// Manhattan traffic and pedestrians on the road graph road-network.js derives from the city as built:
-// - 200 cars (taxis, sedans, SUVs, NYPD cruisers) and 12 MTA buses keep to their lanes and follow the vehicle
+// Terrassa traffic and pedestrians on the road graph road-network.js derives from the city as built:
+// - 200 cars (white taxis, sedans, SUVs, Policia Municipal cars) and 12 TMESA buses keep to their lanes and follow the vehicle
 //   ahead (Intelligent Driver Model), change lanes to overtake or to reach a turn lane, turn into other streets,
 //   stop for the signals street-details.js shows, give way to oncoming traffic when turning left, to the avenue at
 //   unsignalized corners and to pedestrians on crosswalks, and never enter an intersection they can't clear.
@@ -49,24 +50,43 @@ const NEAR_RADIUS = 350;
 const VEHICLE_SPAWN_DISTANCE = 250;
 const PED_SPAWN_DISTANCE = 150;
 
+// TMESA (Transports Municipals d'Egara) urban lines shown on the destination signs. The line numbers are TMESA's;
+// the destinations are plausible neighbourhood names, not the official sign texts (see HOW_TO_IMPROVE.md).
+const BUS_ROUTES = [
+  ['L1', 'CAN ROCA · CENTRE'],
+  ['L2', "CA N'ANGLADA"],
+  ['L3', 'SANT LLORENÇ'],
+  ['L4', 'CAN PALET'],
+  ['L5', 'LES FONTS'],
+  ['L6', 'CAN JOFRESA'],
+  ['L8', "CA N'AURELL"],
+  ['L9', 'HOSPITAL']
+];
+
+// One atlas with a 256 x 64 amber LED sign per route, one row each; the per-instance `busRoute` attribute picks the
+// row. Row 0 is drawn at the bottom because CanvasTexture flips Y.
 function createBusDestinationTexture() {
+  const rows = BUS_ROUTES.length;
   const c = document.createElement('canvas');
   c.width = 256;
-  c.height = 64;
+  c.height = 64 * rows;
   const ctx = c.getContext('2d');
   ctx.fillStyle = '#0c0f14';
-  ctx.fillRect(0, 0, 256, 64);
-  ctx.fillStyle = '#0058b8';
-  ctx.fillRect(6, 8, 62, 48);
-  ctx.fillStyle = '#ffffff';
-  ctx.font = '900 26px Inter, Arial, sans-serif';
-  ctx.textAlign = 'center';
+  ctx.fillRect(0, 0, 256, 64 * rows);
   ctx.textBaseline = 'middle';
-  ctx.fillText('M1', 37, 33);
-  ctx.fillStyle = '#ff9d1c';
-  ctx.font = '800 22px JetBrains Mono, monospace';
-  ctx.textAlign = 'left';
-  ctx.fillText('5 AV / HARLEM', 78, 33);
+  BUS_ROUTES.forEach(([line, destination], route) => {
+    const y0 = (rows - 1 - route) * 64;
+    ctx.fillStyle = '#8b1a2b';
+    ctx.fillRect(6, y0 + 8, 54, 48);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '900 26px Inter, Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(line, 33, y0 + 33);
+    ctx.fillStyle = '#ffb21c';
+    ctx.font = `800 ${destination.length > 13 ? 17 : 21}px JetBrains Mono, monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillText(destination, 68, y0 + 33);
+  });
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
@@ -76,7 +96,7 @@ const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 
 function createTrafficSystem(scene, sidewalks, obstacles) {
   const group = new THREE.Group();
-  group.name = 'ManhattanTrafficAndPedestrians';
+  group.name = 'TrafficAndPedestrians';
   let collisionListener = null;
   const collisionEvent = { a: null, b: null, kind: 'vehicle', x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, speed: 0 };
 
@@ -134,7 +154,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
   };
 
   // =========================================================================
-  // 1. 3D LOFTED NYC YELLOW TAXIS, SEDANS, SUVS & NYPD CRUISERS (200 VEHICLES)
+  // 1. 3D LOFTED TERRASSA WHITE TAXIS, SEDANS, SUVS & POLICIA MUNICIPAL CARS (200 VEHICLES)
   // =========================================================================
   function createVehicle(bus, half, halfWidth, axle, driver, v0) {
     return {
@@ -149,7 +169,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     };
   }
 
-  // Build 3 distinct 3D LoftGeometry vehicle classes (Taxi, Sedan/NYPD, SUV) with separate spinning 3D wheels
+  // Build 3 distinct 3D LoftGeometry vehicle classes (Taxi, Sedan/Police, SUV) with separate spinning 3D wheels
   const taxiGeo = buildCarGeometry(BODY_SPECS.taxi, false);
   const sedanGeo = buildCarGeometry(BODY_SPECS.sedan, false);
   const suvGeo = buildCarGeometry(BODY_SPECS.suv, false);
@@ -159,23 +179,34 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
   const taxiMat = createLoftedCarMaterial(BODY_SPECS.taxi);
   const sedanMat = createLoftedCarMaterial(BODY_SPECS.sedan);
   const suvMat = createLoftedCarMaterial(BODY_SPECS.suv);
-  const carWheelMat = createLoftedCarMaterial(BODY_SPECS.sedan, 0xffbe14);
+  const carWheelMat = createLoftedCarMaterial(BODY_SPECS.sedan, 0xf4f4f1);
 
-  const taxiYellow = new THREE.Color(0xffbe14);
+  // Terrassa's taxis are white (the diagonal red & blue door stripe is painted by the taxi material); the Policia
+  // Municipal cars are white too (chequered band & lightbar from the livery state). The private cars use a
+  // Mediterranean palette, mostly white, silver and grey, a few dark blue, red and black, the odd bright colour.
+  // Both palettes have an odd length: sedans take the odd indices and SUVs the even ones (see the loop below), so an
+  // even length would only ever show half of each palette.
+  const taxiWhite = new THREE.Color(0xf4f4f1);
   const policeWhite = new THREE.Color(0xf6f9fc);
   const sedanPalette = [
-    new THREE.Color(0x1c2026), // Black Town Car / Uber
-    new THREE.Color(0xcfd6de), // Metallic Silver Sedan
-    new THREE.Color(0x1d3b6c), // Deep Navy Sedan
-    new THREE.Color(0x52575e), // Graphite Grey Sedan
-    new THREE.Color(0x6e1f24)  // Burgundy Sedan
+    new THREE.Color(0xeff1f3), // White
+    new THREE.Color(0xc9ced4), // Silver
+    new THREE.Color(0x5a5f66), // Dark grey
+    new THREE.Color(0x1d3b6c), // Dark blue
+    new THREE.Color(0xf3f4f5), // White
+    new THREE.Color(0xb0151f), // Red
+    new THREE.Color(0x8d939a), // Mid grey
+    new THREE.Color(0x1c2026), // Black
+    new THREE.Color(0xd9a21b)  // Mustard yellow
   ];
   const suvPalette = [
-    new THREE.Color(0x16191e), // Executive Black Escalade/Suburban
-    new THREE.Color(0xf0f3f7), // Pearl White SUV
-    new THREE.Color(0x3a434d), // Slate Metallic SUV
-    new THREE.Color(0x28382e), // Forest Green SUV
-    new THREE.Color(0xbec6cf)  // Silver SUV
+    new THREE.Color(0xf0f3f7), // Pearl white
+    new THREE.Color(0x3a434d), // Slate grey
+    new THREE.Color(0xbec6cf), // Silver
+    new THREE.Color(0x16191e), // Black
+    new THREE.Color(0x24406e), // Dark blue
+    new THREE.Color(0x7a1a22), // Dark red
+    new THREE.Color(0xe8e9e6)  // White
   ];
 
   const cars = [];
@@ -185,8 +216,9 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
   let policeCount = 0;
 
   for (let i = 0; i < NUM_CARS; i++) {
-    const isPolice = (i % 40) === 6;
-    const isTaxi = !isPolice && (i % 5) === 0;
+    // Fleet mix: a Policia Municipal car every 60th, a taxi every 9th (fewer than Manhattan's yellow cabs)
+    const isPolice = (i % 60) === 6;
+    const isTaxi = !isPolice && (i % 9) === 0;
     const isSUV = !isPolice && !isTaxi && (i % 2 === 0);
 
     let bodyType = 'sedan';
@@ -195,7 +227,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     if (isTaxi) {
       bodyType = 'taxi';
       taxiCount++;
-      col = taxiYellow;
+      col = taxiWhite;
     } else if (isSUV) {
       bodyType = 'suv';
       suvCount++;
@@ -216,7 +248,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
   // Per body type: the full model (with separately instanced spinning wheels near the camera) and, beyond
   // CAR_PROXY_DISTANCE, the ~250-triangle stand-in. Instance slots are handed out every frame to the cars the camera
   // can see (or whose shadow it may see), see renderCar(). Per-instance paint & lamp / livery state the car material
-  // reads: brake lights, left (+x) & right (-x) turn signals, livery (1 = NYPD).
+  // reads: brake lights, left (+x) & right (-x) turn signals, livery (1 = Policia Municipal).
   const bodies = {};
   for (const [kind, geo, count, mat] of [['taxi', taxiGeo, taxiCount, taxiMat], ['sedan', sedanGeo, sedanCount, sedanMat], ['suv', suvGeo, suvCount, suvMat]]) {
     const n = Math.max(1, count);
@@ -263,7 +295,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     }
   }
 
-  // NYPD roof light bars (the blue & white livery is painted by the sedan material from the instance's carState)
+  // Policia Municipal roof light bars (the chequered livery is painted by the sedan material from the instance's carState)
   const policeLightbarInst = new THREE.InstancedMesh(buildLightbarGeometry(BODY_SPECS.sedan), createLightbarMaterial(), Math.max(1, policeCount));
   const carShadowInst = new THREE.InstancedMesh(unitPlane, contactShadowMat, NUM_CARS);
   carShadowInst.renderOrder = 998;
@@ -282,19 +314,24 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
   );
 
   // =========================================================================
-  // 2. LOFTED MTA SELECT BUS SERVICE BLUE & WHITE CITY BUSES (32 BUSES)
+  // 2. LOFTED TMESA WHITE & GARNET CITY BUSES (12 BUSES)
   // =========================================================================
   const busBodyGeo = buildLoftedBusBodyGeometry();
   // Per-instance lamp state the bus material reads: brake lights, left (+x) & right (-x) turn signals (renderBus)
   const busStates = new THREE.InstancedBufferAttribute(new Float32Array(NUM_BUSES * 4), 4);
   busBodyGeo.setAttribute('busState', busStates);
-  // Destination signs above the windshield, by the front door & above the rear window
+  // Destination signs above the windshield, by the front door & above the rear window; the per-instance `busRoute`
+  // picks the line in the sign atlas (written by renderBus, like busState)
   const busHeaderGeo = buildBusSignGeometry();
+  const busRoutes = new THREE.InstancedBufferAttribute(new Float32Array(NUM_BUSES), 1);
+  busHeaderGeo.setAttribute('busRoute', busRoutes);
 
   const busBodyMat = createLoftedBusMaterial();
-  const busDestMat = new THREE.MeshBasicNodeMaterial({
-    map: createBusDestinationTexture()
-  });
+  const busDestMat = new THREE.MeshBasicNodeMaterial();
+  busDestMat.colorNode = texture(
+    createBusDestinationTexture(),
+    vec2(uv().x, uv().y.add(attribute('busRoute', 'float')).div(BUS_ROUTES.length))
+  );
 
   const busWheelMat = createBusWheelMaterial();
   const busBodyInst = new THREE.InstancedMesh(busBodyGeo, busBodyMat, NUM_BUSES);
@@ -309,7 +346,9 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
   busWheelRightInst.castShadow = busWheelRightInst.receiveShadow = true;
 
   const buses = [];
-  for (let i = 0; i < NUM_BUSES; i++) buses.push(createVehicle(true, 6.0, 1.3, 3.6, BUS_DRIVER, 8 + (i % 3)));
+  for (let i = 0; i < NUM_BUSES; i++) {
+    buses.push(Object.assign(createVehicle(true, 6.0, 1.3, 3.6, BUS_DRIVER, 8 + (i % 3)), { route: i % BUS_ROUTES.length }));
+  }
   const vehicles = [...cars, ...buses];
   group.add(busBodyInst, busHeaderInst, busWheelLeftInst, busWheelRightInst);
 
@@ -394,7 +433,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
 
   const policeLightPool = [];
   for (let i = 0; i < POLICE_LIGHT_POOL_SIZE; i++) {
-    const pt = new THREE.PointLight(0xff1828, 0, 12.0, 1.25);
+    const pt = new THREE.PointLight(0x2a6cff, 0, 12.0, 1.25);
     pt.position.set(0, -1000, 0);
     trafficLightsGroup.add(pt);
     policeLightPool.push(pt);
@@ -1464,15 +1503,15 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     return false;
   }
 
-  // Do people on crosswalk `side` have the WALK? Across the avenue with the cross street's traffic, across the street
-  // with the avenue's.
-  const walkOn = (side) => (side >= 2 ? stWalk : aveWalk);
+  // Do people on crosswalk `side` of node n have the WALK? Across the main road (right-of-way group 0) with the cross
+  // street's traffic, across a cross street with the main road's (road-network.js n.sideGroup).
+  const walkOn = (n, side) => ((n.sideGroup ? n.sideGroup[side] : side >= 2 ? 0 : 1) === 0 ? stWalk : aveWalk);
 
   // May p step off the curb onto its crosswalk? On the WALK (early in the parallel traffic's green, so red for the
   // traffic arriving over it), once no vehicle is crossing it or committed to, and none is too close to stop
   function mayCross(p) {
     const n = p.node;
-    if (!walkOn(p.side) || n.crossing[p.side] > 0) return false;
+    if (!walkOn(n, p.side) || n.crossing[p.side] > 0) return false;
     const e = n.approach[p.side];
     if (!e) return true;
     for (const list of e.occ) {
@@ -1588,7 +1627,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     p.t = t;
     p.x = p.ax + p.ux * t;
     p.z = p.az + p.uz * t;
-    if (p.node && ((t > KERB && t < p.len - KERB) || (p.waiting && walkOn(p.side)))) {
+    if (p.node && ((t > KERB && t < p.len - KERB) || (p.waiting && walkOn(p.node, p.side)))) {
       p.coord = p.side >= 2 ? p.x : p.z;
       if (!p.node.walkers.length) walkedNodes.push(p.node);
       p.node.walkers.push(p);
@@ -1790,6 +1829,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     dummy.updateMatrix();
     busBodyInst.setMatrixAt(i, dummy.matrix);
     busHeaderInst.setMatrixAt(i, dummy.matrix);
+    busRoutes.array[i] = b.route;
     writeLampState(b, busStates.array, i * 4);
 
     const dxCam = b.x - camX;
@@ -1867,7 +1907,8 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
       spot.position.set(0, -1000, 0);
     }
 
-    // 1. NYPD emergency roof lightbar flashes (smoothly pulsing red/blue 360° PointLights on nearby patrol cruisers)
+    // 1. Policia Municipal roof lightbar flashes (smoothly pulsing blue 360° PointLights on nearby patrol cars, the
+    //    light hopping between the two halves of the bar; Spanish police bars carry no red)
     let policeLightsUsed = 0;
     for (let i = 0; i < litVehicleCount && policeLightsUsed < POLICE_LIGHT_POOL_SIZE; i++) {
       const v = litVehicles[i];
@@ -1875,11 +1916,11 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
       const fade = smoothDistFade(v._effDist, 52, 88);
       if (fade <= 0.001) continue;
       const wave = Math.sin((clock + v.blinkPhase) * Math.PI * 6.0);
-      const redPhase = wave >= 0;
+      const leftPhase = wave >= 0;
       const pulse = 0.35 + 0.65 * Math.abs(wave);
-      const side = redPhase ? -0.36 : 0.36;
+      const side = leftPhase ? -0.36 : 0.36;
       const pt = policeLightPool[policeLightsUsed++];
-      pt.color.setHex(redPhase ? 0xff1828 : 0x1868ff);
+      pt.color.setHex(leftPhase ? 0x2a6cff : 0x4d8cff);
       pt.position.set(v.x + side * v._cosY - 0.25 * v._sinY, 1.85, v.z - side * v._sinY - 0.25 * v._cosY);
       pt.distance = 12.0;
       pt.intensity = 42.0 * tailScale * fade * pulse;
@@ -1893,7 +1934,7 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
 
   // Walking surface around a pedestrian: sidewalks are 0.22 m above the road, and crosswalk tracks start and end
   // with 2 m of sidewalk (the rig steps down and up the curbs)
-  const SIDEWALK_Y = 0.22;
+  const SIDEWALK_Y = WORLD_BOUNDS.sidewalkHeight;
   const CROSSWALK_Y = 0.012;
   function pedGround(p, x, z) {
     if (!p.node) return SIDEWALK_Y;
@@ -2061,7 +2102,10 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
     syncInst(busWheelLeftInst, visibleBuses * 2);
     syncInst(busWheelRightInst, visibleBuses * 2);
     syncInst(busShadowInst, visibleBuses);
-    if (visibleBuses > 0) flagRange(busStates, visibleBuses);
+    if (visibleBuses > 0) {
+      flagRange(busStates, visibleBuses);
+      flagRange(busRoutes, visibleBuses);
+    }
     updateTrafficLights();
 
     // 2. Pedestrians
@@ -2108,10 +2152,11 @@ function createTrafficSystem(scene, sidewalks, obstacles) {
 }
 
 // ============================================================================
-// AMBIENT SHORE-HIGHWAY TRAFFIC (West Side Highway, Henry Hudson Parkway, FDR Drive)
+// AMBIENT HIGHWAY TRAFFIC (lane polylines outside the road graph)
 // ============================================================================
-// The shore highways city-grid.js lays along both rivers are not part of the road graph, so a lighter model fills
-// them: cars follow each lane's centre line and keep their distance with the IDM. Nobody changes lanes, so the order
+// Kept from the Manhattan build (West Side Highway, FDR Drive): main.js still calls it, with an empty lane list in
+// Terrassa, which it tolerates (no cars, empty instanced meshes). It could carry the C-58 / B-40 traffic later.
+// Highway lanes outside the road graph are filled by a lighter model: cars follow each lane's centre line and keep their distance with the IDM. Nobody changes lanes, so the order
 // in a lane never changes and every car's leader is simply the next one (cyclically: cars dip below the deck at the
 // end of a lane as if into an underpass and come back up at its start; West St and the FDR's lanes are joined through
 // the Battery Park Underpass, lane points well below ground). Cars queue behind the player standing or
@@ -2131,9 +2176,9 @@ function createHighwayTraffic(scene, lanes) {
   scene.add(group);
   const KINDS = ['taxi', 'sedan', 'suv'];
   const PALETTES = {
-    taxi: [0xffbe14],
-    sedan: [0x1c2026, 0xcfd6de, 0x1d3b6c, 0x52575e, 0x6e1f24, 0x8a8f96, 0xe9ecef],
-    suv: [0x16191e, 0xf0f3f7, 0x3a434d, 0x28382e, 0xbec6cf, 0x5b2a2a]
+    taxi: [0xf4f4f1],
+    sedan: [0xeff1f3, 0xc9ced4, 0x5a5f66, 0x1d3b6c, 0xb0151f, 0x8d939a, 0x1c2026, 0xe9ecef],
+    suv: [0xf0f3f7, 0x3a434d, 0xbec6cf, 0x16191e, 0x24406e, 0x7a1a22]
   };
   let seed = 20240917;
   const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;

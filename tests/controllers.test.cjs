@@ -23,7 +23,9 @@ function keyboardHarness(nyc = {}) {
   const window = eventTarget();
   const document = { ...eventTarget(), hidden: false };
   const config = {
-    streetZ: () => 0,
+    SPAWN: { x: 0, z: 0, heading: 0, street: 'Plaça Vella' },
+    parkAt: () => null,
+    blockAt: () => null,
     isTypingInField: (event) => ['INPUT', 'SELECT'].includes(event.target?.tagName),
     ...nyc
   };
@@ -36,7 +38,7 @@ function keyboardHarness(nyc = {}) {
       './actor-models.js': {},
       './pedestrians.js': {},
       './vehicle-lights.js': {},
-      './landmarks.js': {}
+      './city-grid.js': { groundHeightAt: () => 0 }
     }
   });
   // Exercise the production event handlers without constructing the scene's 3D models.
@@ -195,8 +197,7 @@ for (const mode of ['Person', 'Car', 'Cyclist', 'Helicopter']) {
 
 function teleportHarness(mode, colliders = [], shore = () => ({ westX: -500, eastX: 500 })) {
   const harness = keyboardHarness({
-    ISLAND_BOUNDS: { minX: -500, maxX: 500, minZ: -500, maxZ: 500, sidewalkHeight: 0.22 },
-    CENTRAL_PARK_BOUNDS: { minX: 1000, maxX: 1100, minZ: 1000, maxZ: 1100 },
+    ISLAND_BOUNDS: { minX: -500, maxX: 500, minZ: -500, maxZ: 500, sidewalkHeight: 0.15 },
     getIslandBoundsAtZ: shore,
     blockAt: () => null
   });

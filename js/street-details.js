@@ -1,74 +1,145 @@
 import * as THREE from 'three/webgpu';
-import { Fn, float, color, positionWorld, uniform, mod, fract, step, smoothstep, mix } from 'three/tsl';
+import { Fn, float, color, positionLocal, uniform, mod, fract, step, smoothstep, mix, uv, texture, attribute, vec2, clamp } from 'three/tsl';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-import {
-  AVENUES,
-  STREETS,
-  streetZ,
-  SIGNAL_TIMING,
-  blockAt,
-  fromOldFrame,
-  CENTRAL_PARK_BOUNDS as CPB,
-  BLOCKS,
-  LANDMARK_SITES
-} from './city-config.js';
-import { cityUniforms, createSteamMaterial, createTreeGrateMaterial, createGodRayMaterial } from './tsl-materials.js';
+import { SIGNAL_TIMING, blockAt, STREET_TREES, nearestRoads, prettyName, UNNAMED, LAND_CLASS, WORLD_BOUNDS, blockProfile } from './city-config.js';
+import { cityUniforms, createTreeGrateMaterial } from './tsl-materials.js';
 import { createTreeField } from './trees.js';
-import { pavedPlazaRects, centralParkClearings, parkTreeSites, sidewalkBlocks, parkLampSites } from './city-grid.js';
-import { bryantParkLawn } from './landmarks.js';
+import { pavedPlazaRects, parkTreeSites, sidewalkBlocks, parkLampSites } from './city-grid.js';
+import { GEO } from './terrassa-geodata.js';
 
 // js/street-details.js
-// Populates Manhattan streets with authentic NYC street furniture using InstancedMesh:
-// - Cantilevered NYC Yellow Traffic Signals at all 63 intersections
-// - NYC DOT Cobra-head LED Streetlights
-// - Con Edison Orange/White Steam Stacks + Volumetric TSL Rising Steam Plumes
-// - MTA Subway Stair Entrances with Glowing Green Globe Lamps
-// - NYC Hot Dog / Halal Street Carts with Blue & Yellow Umbrellas
-// - Fire Hydrants, USPS Mailboxes, Litter Baskets, and Park/Street Trees
+// Populates the streets of Terrassa with their furniture, from the real street graph (GEO.roadGraph) and the real
+// curb islands (city-grid.js sidewalkBlocks), all InstancedMesh:
+// - Traffic signals on the right-hand kerb of every approach of the 236 signalled junctions (OSM), on the shared signal
+//   clock & SIGNAL_TIMING that js/traffic.js obeys: the widest road at each junction runs on the main phase (group 0)
+// - Red / green man pedestrian signals at the signalled crossings (OSM), litter bins & bollards
+// - Catalan street name plaques (white plaque, blue lettering, the full name: "Carrer de Sant Pere") on the building
+//   corner where two named streets meet
+// - Column luminaires along every kerb (wall-mounted lanterns in the old town's lanes), lamps on the medians
+// - Street trees: the 834 mapped trees (OSM) plus rows of planes, limes & small ornamentals in tree pits along the
+//   wider streets, the planted medians of the avenues & the Rambla d'Ègara, and the park, square & wood trees laid
+//   out by city-grid.js
 
-function createStreetSignBladeTexture(label) {
-  const c = document.createElement('canvas');
-  c.width = 256;
-  c.height = 64;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = '#0d6b3f';
-  ctx.fillRect(0, 0, 256, 64);
-  ctx.strokeStyle = '#ffffff';
-  ctx.lineWidth = 5;
-  ctx.strokeRect(4, 4, 248, 56);
-  ctx.fillStyle = '#ffffff';
-  ctx.font = '800 30px Inter, Arial, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(label, 128, 34);
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
+const SW_TOP = WORLD_BOUNDS.sidewalkHeight + 0.005; // top of the sidewalk slabs (city-grid.js)
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Street name plaques: all the names go into a few canvas atlases (160 x 64 px cells, 288 per 1920 x 1536 atlas); each
+// plaque instance picks its cell through an instanced attribute, so a whole atlas is one draw call
+// ---------------------------------------------------------------------------------------------------------------------
+const PLAQUE_W = 160;
+const PLAQUE_H = 64;
+const PLAQUE_COLS = 12;
+const PLAQUE_ROWS = 24;
+const PLAQUE_PER_ATLAS = PLAQUE_COLS * PLAQUE_ROWS;
+const ODONYM = /^(Carrer|Carretera|Avinguda|Passeig|Rambla|Plaça|Placeta|Passatge|Camí|Ronda|Travessera|Via|Raval|Pont|Torrent|Riera|Baixada|Pujada|Portal|Carreró|Autovia|Autopista|Polígon)(\s+(?:de la|de les|dels|del|de l'|de|d'|la|el|les|els))?\s*(.*)$/i;
+
+// "Carrer de la Font Vella" -> ["Carrer de la", "Font Vella"]; names without a generic stay on one line
+function splitOdonym(name) {
+  const m = name.match(ODONYM);
+  if (!m || !m[3]) return [null, name];
+  return [(m[1] + (m[2] || '')).replace(/\s+/g, ' ').trim(), m[3].trim()];
+}
+
+class PlaqueAtlas {
+  constructor() {
+    this.cells = new Map(); // name -> { atlas, u0, v0 }
+    this.canvases = [];
+    this.textures = [];
+  }
+  _canvas(i) {
+    if (this.canvases[i]) return this.canvases[i];
+    const c = document.createElement('canvas');
+    c.width = PLAQUE_W * PLAQUE_COLS;
+    c.height = PLAQUE_H * PLAQUE_ROWS;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#f4f2ec';
+    ctx.fillRect(0, 0, c.width, c.height);
+    this.canvases[i] = c;
+    return c;
+  }
+  cell(name) {
+    let cell = this.cells.get(name);
+    if (cell) return cell;
+    const index = this.cells.size;
+    const atlas = Math.floor(index / PLAQUE_PER_ATLAS);
+    const slot = index % PLAQUE_PER_ATLAS;
+    const col = slot % PLAQUE_COLS;
+    const row = Math.floor(slot / PLAQUE_COLS);
+    const ctx = this._canvas(atlas).getContext('2d');
+    const x0 = col * PLAQUE_W;
+    const y0 = row * PLAQUE_H;
+    // cream enamel plaque with a dark blue border & lettering (the city's current model)
+    ctx.fillStyle = '#f4f2ec';
+    ctx.fillRect(x0, y0, PLAQUE_W, PLAQUE_H);
+    ctx.strokeStyle = '#1d3f7a';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x0 + 2.5, y0 + 2.5, PLAQUE_W - 5, PLAQUE_H - 5);
+    ctx.fillStyle = '#1d3f7a';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const [generic, rest] = splitOdonym(name);
+    const maxW = PLAQUE_W - 14;
+    const fit = (text, weight, size, minSize) => {
+      let s = size;
+      ctx.font = `${weight} ${s}px Inter, Arial, sans-serif`;
+      while (ctx.measureText(text).width > maxW && s > minSize) {
+        s -= 1;
+        ctx.font = `${weight} ${s}px Inter, Arial, sans-serif`;
+      }
+    };
+    if (generic) {
+      fit(generic, '500', 14, 9);
+      ctx.fillText(generic, x0 + PLAQUE_W / 2, y0 + 18);
+      fit(rest, '700', 22, 9);
+      ctx.fillText(rest, x0 + PLAQUE_W / 2, y0 + 41);
+    } else {
+      fit(rest, '700', 20, 9);
+      ctx.fillText(rest, x0 + PLAQUE_W / 2, y0 + PLAQUE_H / 2);
+    }
+    cell = { atlas, u0: col / PLAQUE_COLS, v0: 1 - (row + 1) / PLAQUE_ROWS };
+    this.cells.set(name, cell);
+    return cell;
+  }
+  finish() {
+    this.textures = this.canvases.map((c) => {
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = 4;
+      return tex;
+    });
+    return this.textures;
+  }
+}
+
+function createPlaqueMaterial(tex) {
+  const mat = new THREE.MeshStandardNodeMaterial({ roughness: 0.3, metalness: 0.05 });
+  const cell = attribute('aPlaqueCell', 'vec2');
+  mat.colorNode = texture(tex, uv().mul(vec2(1 / PLAQUE_COLS, 1 / PLAQUE_ROWS)).add(cell));
+  return mat;
 }
 
 /**
- * TSL 3-Aspect Traffic Signal Lens Material (Red y=5.78, Amber y=5.42, Green y=5.06)
- * Driven by the shared signal clock and SIGNAL_TIMING (city-config.js), which js/traffic.js obeys.
+ * TSL 3-aspect traffic signal lens material: red / amber / green picked from each lens's height in the head (local y
+ * +0.36 / 0 / -0.36), lit by the shared signal clock & SIGNAL_TIMING (city-config.js), which js/traffic.js obeys.
+ * Main-road heads (group 0 at the junction) run the "avenue" phase, the others the cross-street phase.
  */
-function createTrafficSignalLensMaterial(isAvenueHead, clock) {
+function createTrafficSignalLensMaterial(isMainHead, clock) {
   const { cycle, avenueAmber, avenueRed, streetAmber } = SIGNAL_TIMING;
   const mat = new THREE.MeshBasicNodeMaterial();
   mat.colorNode = Fn(() => {
     const t = mod(clock, cycle);
-    const wy = positionWorld.y;
-    const isTopRed = step(5.60, wy);
-    const isBottomGreen = float(1.0).sub(step(5.24, wy));
+    const ly = positionLocal.y;
+    const isTopRed = step(0.18, ly);
+    const isBottomGreen = float(1.0).sub(step(-0.18, ly));
     const isMidAmber = float(1.0).sub(isTopRed).mul(float(1.0).sub(isBottomGreen));
 
-    // Avenue phase: Green, then Amber from avenueAmber, Red from avenueRed
-    // Street phase: Red until avenueRed, then Green, Amber from streetAmber
-    const greenActive = isAvenueHead
+    const greenActive = isMainHead
       ? float(1.0).sub(step(avenueAmber, t))
       : step(avenueRed, t).mul(float(1.0).sub(step(streetAmber, t)));
-    const amberActive = isAvenueHead
+    const amberActive = isMainHead
       ? step(avenueAmber, t).mul(float(1.0).sub(step(avenueRed, t)))
       : step(streetAmber, t);
-    const redActive = isAvenueHead
+    const redActive = isMainHead
       ? step(avenueRed, t)
       : float(1.0).sub(step(avenueRed, t));
 
@@ -86,25 +157,33 @@ function createTrafficSignalLensMaterial(isAvenueHead, clock) {
   return mat;
 }
 
-// Pedestrian signal for crossing alongside the avenue: WALK, then a flashing hand until the avenue's amber, then a
-// steady hand
-function createWalkSignalMaterial(clock) {
-  const { cycle, avenueAmber, walk } = SIGNAL_TIMING;
+/**
+ * Pedestrian signal (red man above, green man below): green while the traffic parallel to the crossing has its WALK
+ * window (walkSignal in city-config.js), flashing green until that traffic's amber, red otherwise.
+ */
+function createPedSignalMaterial(isAvenue, clock) {
+  const { cycle, avenueAmber, avenueRed, streetAmber, walk } = SIGNAL_TIMING;
+  const t0 = isAvenue ? 0 : avenueRed; // when the parallel traffic turns green
+  const greenEnd = (isAvenue ? avenueAmber : streetAmber) - t0; // ... and amber
   const mat = new THREE.MeshBasicNodeMaterial();
   mat.colorNode = Fn(() => {
-    const t = mod(clock, cycle);
-    const isWalk = float(1.0).sub(step(walk, t));
-    const isFlashing = step(walk, t).mul(float(1.0).sub(step(avenueAmber, t)));
-    const handLit = float(1.0).sub(isFlashing.mul(step(0.5, fract(t))));
-    const hand = mix(color(0x14181e), color(0xff5518), handLit);
-    return mix(hand, color(0xf4f9ff), isWalk);
+    const t = mod(clock.sub(t0).add(cycle), cycle);
+    const walking = float(1.0).sub(step(walk, t));
+    const flashing = step(walk, t).mul(float(1.0).sub(step(greenEnd, t)));
+    const blink = step(0.5, fract(t.mul(1.4)));
+    const greenLit = clamp(walking.add(flashing.mul(blink)), 0.0, 1.0);
+    const redLit = float(1.0).sub(clamp(walking.add(flashing), 0.0, 1.0));
+    const isTop = step(0.0, positionLocal.y);
+    const lit = isTop.mul(redLit).add(float(1.0).sub(isTop).mul(greenLit));
+    const hue = mix(color(0x22ff66), color(0xff2a2a), isTop);
+    return mix(color(0x14181e), hue.mul(1.3), lit);
   })();
   return mat;
 }
 
 function buildStreetDetails(scene) {
   const group = new THREE.Group();
-  group.name = 'ManhattanStreetDetails';
+  group.name = 'TerrassaStreetDetails';
 
   const dummy = new THREE.Object3D();
   const unitBox = new THREE.BoxGeometry(1, 1, 1);
@@ -117,230 +196,427 @@ function buildStreetDetails(scene) {
   // Signal clock (seconds), set every frame by main.js
   const signalClock = uniform(0);
 
-  // Shared materials
-  const poleMetalMat = new THREE.MeshStandardNodeMaterial({
-    color: 0x3b4046,
-    roughness: 0.45,
-    metalness: 0.78
-  });
-  const signalHousingMat = new THREE.MeshStandardNodeMaterial({
-    color: 0xe6a817, // Authentic NYC DOT school-bus/marigold yellow housing
-    roughness: 0.38,
-    metalness: 0.35,
-    side: THREE.DoubleSide // the tunnel visors are open half-tubes
-  });
-  const aveSignalLensMat = createTrafficSignalLensMaterial(true, signalClock);
-  const streetSignalLensMat = createTrafficSignalLensMaterial(false, signalClock);
-  const walkSignalGlow = createWalkSignalMaterial(signalClock);
-  // Cobra-head LED streetlight lens & pedestrian post-top globe: pale diffuser by day, warm white after dusk
+  // ---- Shared materials --------------------------------------------------------------------------------------------
+  const poleMetalMat = new THREE.MeshStandardNodeMaterial({ color: 0x3b4046, roughness: 0.45, metalness: 0.78 });
+  const darkGreenMat = new THREE.MeshStandardNodeMaterial({ color: 0x2a3b33, roughness: 0.5, metalness: 0.55 }); // old-town lanterns, bins
+  const signalHousingMat = new THREE.MeshStandardNodeMaterial({ color: 0x24272b, roughness: 0.42, metalness: 0.3, side: THREE.DoubleSide });
+  const mainSignalLensMat = createTrafficSignalLensMaterial(true, signalClock);
+  const crossSignalLensMat = createTrafficSignalLensMaterial(false, signalClock);
+  const pedMainMat = createPedSignalMaterial(true, signalClock);
+  const pedCrossMat = createPedSignalMaterial(false, signalClock);
+  // Luminaire lenses: pale diffuser by day, warm white after dusk
   const lampBulbGlow = new THREE.MeshBasicNodeMaterial();
   lampBulbGlow.colorNode = mix(color(0x8f918c), color(0xfff1d6).mul(2.1), smoothstep(0.4, 1.1, cityUniforms.uInteriorGlow));
-  const pedGlobeGlow = new THREE.MeshBasicNodeMaterial();
-  pedGlobeGlow.colorNode = mix(color(0xd4d2c8), color(0xffe4b0).mul(1.95), smoothstep(0.4, 1.1, cityUniforms.uInteriorGlow));
-  const streetBladeMat = new THREE.MeshStandardNodeMaterial({
-    map: createStreetSignBladeTexture('5TH AVE · 42 ST'),
-    roughness: 0.32
-  });
+  const lanternGlow = new THREE.MeshBasicNodeMaterial();
+  lanternGlow.colorNode = mix(color(0xd4d2c8), color(0xffe4b0).mul(1.95), smoothstep(0.4, 1.1, cityUniforms.uInteriorGlow));
+  const plaqueFrameMat = new THREE.MeshStandardNodeMaterial({ color: 0x1d3f7a, roughness: 0.4, metalness: 0.2 });
+  const bollardMat = new THREE.MeshStandardNodeMaterial({ color: 0x3a3d40, roughness: 0.6, metalness: 0.5 });
 
-  // 12-inch three-section signal head (origin at its centre, y = 5.42): yellow housing, a tunnel visor over each lens
-  // and a hanger to the mast arm, lenses on both faces (+-z) so it reads from both approaches; the lens material
-  // picks red / amber / green from each lens's world height (5.78 / 5.42 / 5.06)
-  const HEAD_W = 0.4;
-  const HEAD_H = 1.12;
-  const HEAD_D = 0.28;
-  const LENS_R = 0.145;
+  // ---- Geometries ---------------------------------------------------------------------------------------------------
+  // 200 mm three-aspect head (origin at its centre): dark housing, a visor over each lens, lenses on the +z face
+  const HEAD_W = 0.34;
+  const HEAD_H = 1.0;
+  const HEAD_D = 0.26;
+  const LENS_R = 0.11;
   const LENS_Y = [0.36, 0, -0.36];
-  const bothFaces = (geo) => [geo, geo.clone().rotateY(Math.PI)];
   const signalHousingGeo = mergeGeometries([
     new THREE.BoxGeometry(HEAD_W, HEAD_H, HEAD_D),
-    new THREE.BoxGeometry(0.07, 0.2, 0.07).translate(0, HEAD_H / 2 + 0.1, 0),
-    ...LENS_Y.flatMap((ly) => bothFaces(
-      new THREE.CylinderGeometry(LENS_R + 0.03, LENS_R + 0.03, 0.24, 14, 1, true, Math.PI / 2, Math.PI)
-        .rotateX(Math.PI / 2).translate(0, ly, HEAD_D / 2 + 0.12)
-    ))
+    new THREE.BoxGeometry(0.06, 0.16, 0.06).translate(0, -HEAD_H / 2 - 0.08, 0),
+    ...LENS_Y.map((ly) => new THREE.CylinderGeometry(LENS_R + 0.03, LENS_R + 0.03, 0.2, 14, 1, true, Math.PI / 2, Math.PI)
+      .rotateX(Math.PI / 2).translate(0, ly, HEAD_D / 2 + 0.1))
   ].map((g) => g.toNonIndexed()));
-  const signalLensGeo = mergeGeometries(LENS_Y.flatMap((ly) => bothFaces(new THREE.CircleGeometry(LENS_R, 18).translate(0, ly, HEAD_D / 2 + 0.004))));
-  // Pedestrian signal: housing with the WALK / hand face lit on both sides (+-z, toward the crosswalk's far end)
-  const walkHousingGeo = new THREE.BoxGeometry(0.34, 0.4, 0.24);
-  const walkPanelGeo = mergeGeometries(bothFaces(new THREE.PlaneGeometry(0.27, 0.31).translate(0, 0, 0.125)));
-  // Cobra-head luminaire on the end of the arm: flattened grey housing, flat lens underneath
-  const lampHousingGeo = new THREE.SphereGeometry(1, 14, 8, 0, Math.PI * 2, 0, Math.PI / 2).scale(0.7, 0.2, 0.3);
-  const lampLensGeo = new THREE.CircleGeometry(1, 16).rotateX(Math.PI / 2).scale(0.6, 1, 0.24).translate(0, -0.005, 0);
-  // Classic NYC cast-iron pedestrian post-top globe lightpole (fluted base + shaft + decorative capital + opal globe)
-  const pedLampPostGeo = mergeGeometries([
-    new THREE.CylinderGeometry(0.11, 0.16, 0.85, 10).translate(0, 0.425, 0),
-    new THREE.CylinderGeometry(0.065, 0.085, 2.75, 10).translate(0, 2.22, 0),
-    new THREE.CylinderGeometry(0.14, 0.07, 0.16, 10).translate(0, 3.62, 0)
+  const signalLensGeo = mergeGeometries(LENS_Y.map((ly) => new THREE.CircleGeometry(LENS_R, 18).translate(0, ly, HEAD_D / 2 + 0.004)));
+  // Pedestrian signal: two-aspect housing with the men on the +z face
+  const pedHousingGeo = mergeGeometries([
+    new THREE.BoxGeometry(0.26, 0.56, 0.2),
+    new THREE.BoxGeometry(0.05, 0.14, 0.05).translate(0, -0.35, 0)
   ].map((g) => g.toNonIndexed()));
-  const pedGlobeGeo = new THREE.SphereGeometry(0.23, 12, 10).translate(0, 3.84, 0);
+  const pedLensGeo = mergeGeometries([
+    new THREE.CircleGeometry(0.085, 14).translate(0, 0.14, 0.104),
+    new THREE.CircleGeometry(0.085, 14).translate(0, -0.14, 0.104)
+  ]);
+  // Column luminaire (8 m column, short arm, flat LED luminaire) & its lens
+  const columnGeo = mergeGeometries([
+    new THREE.CylinderGeometry(0.07, 0.11, 8.0, 10).translate(0, 4.0, 0),
+    new THREE.CylinderGeometry(0.16, 0.18, 0.5, 10).translate(0, 0.25, 0)
+  ].map((g) => g.toNonIndexed()));
+  const columnArmGeo = mergeGeometries([
+    new THREE.CylinderGeometry(0.045, 0.055, 1.5, 8).rotateZ(Math.PI / 2).translate(0.75, 7.85, 0),
+    new THREE.BoxGeometry(0.62, 0.1, 0.28).translate(1.4, 7.78, 0)
+  ].map((g) => g.toNonIndexed()));
+  const columnLensGeo = new THREE.PlaneGeometry(0.5, 0.2).rotateX(Math.PI / 2).translate(1.4, 7.725, 0);
+  // Residential post: 4.6 m post with a lantern (box) on top
+  const postGeo = mergeGeometries([
+    new THREE.CylinderGeometry(0.05, 0.08, 4.4, 8).translate(0, 2.2, 0),
+    new THREE.CylinderGeometry(0.12, 0.14, 0.4, 8).translate(0, 0.2, 0),
+    new THREE.BoxGeometry(0.34, 0.06, 0.34).translate(0, 4.42, 0),
+    new THREE.ConeGeometry(0.26, 0.2, 4).rotateY(Math.PI / 4).translate(0, 4.95, 0)
+  ].map((g) => g.toNonIndexed()));
+  const postLanternGeo = new THREE.BoxGeometry(0.26, 0.4, 0.26).translate(0, 4.65, 0);
+  // Old-town wall lantern: bracket from the facade (origin on the facade, +z out over the lane) & lantern
+  const wallBracketGeo = mergeGeometries([
+    new THREE.BoxGeometry(0.05, 0.05, 0.8).translate(0, 4.6, 0.4),
+    new THREE.BoxGeometry(0.05, 0.6, 0.05).translate(0, 4.3, 0.025),
+    new THREE.BoxGeometry(0.3, 0.05, 0.3).translate(0, 4.35, 0.72),
+    new THREE.ConeGeometry(0.24, 0.18, 4).rotateY(Math.PI / 4).translate(0, 4.64, 0.72)
+  ].map((g) => g.toNonIndexed()));
+  const wallLanternGeo = new THREE.BoxGeometry(0.22, 0.34, 0.22).translate(0, 4.4, 0.72);
+  // Plaque: enamel face & blue frame
+  const plaqueFaceGeo = new THREE.PlaneGeometry(0.6, 0.3).translate(0, 0, 0.017);
+  const plaqueFrameGeo = new THREE.BoxGeometry(0.64, 0.34, 0.03);
+  // Litter bin & bollard
+  const binGeo = mergeGeometries([
+    new THREE.CylinderGeometry(0.2, 0.18, 0.8, 10).translate(0, 0.4, 0),
+    new THREE.TorusGeometry(0.2, 0.02, 6, 12).rotateX(Math.PI / 2).translate(0, 0.8, 0)
+  ].map((g) => g.toNonIndexed()));
+  const bollardGeo = mergeGeometries([
+    new THREE.CylinderGeometry(0.06, 0.07, 0.85, 8).translate(0, 0.425, 0),
+    new THREE.SphereGeometry(0.07, 8, 6).translate(0, 0.85, 0)
+  ].map((g) => g.toNonIndexed()));
 
-  // =========================================================================
-  // 1. NYC CANTILEVERED TRAFFIC SIGNALS, STREET BLADES & WALK SIGNALS
-  // =========================================================================
-  const poleMatrices = [];
-  const armMatrices = [];
-  const yellowBoxMatrices = [];
-  const aveLensMatrices = [];
-  const streetLensMatrices = [];
-  const streetBladeMatrices = [];
-  const walkBoxMatrices = [];
+  // ---- Instance accumulators -----------------------------------------------------------------------------------------
+  const M = {
+    signalPole: [], signalArm: [], head: [], mainLens: [], crossLens: [], pedPole: [], pedHead: [], pedMainLens: [], pedCrossLens: [],
+    column: [], columnArm: [], post: [], wall: [], plaque: [], bin: [], bollard: []
+  };
+  const plaqueCells = []; // [u0, v0] per plaque, parallel to M.plaque
+  const plaqueAtlasOf = []; // atlas index per plaque
   const audioSignals = [];
-  const lampHeadMatrices = [];
-  const pedPostMatrices = [];
-  const cobraLampSites = [];
-  const streetPointSites = [];
-  const placedPoles = [];
+  const spotSites = []; // column luminaires: pooled spot lights { x, y, z, tx, tz }
+  const pointSites = []; // lanterns, posts & park lamps: pooled point lights { x, y, z, color, intensity, dist }
+  const pushMatrix = (list, x, y, z, yaw = 0, sx = 1, sy = 1, sz = 1) => {
+    dummy.position.set(x, y, z);
+    dummy.rotation.set(0, yaw, 0);
+    dummy.scale.set(sx, sy, sz);
+    dummy.updateMatrix();
+    list.push(dummy.matrix.clone());
+  };
 
+  // ---- Placement helpers ---------------------------------------------------------------------------------------------
   const plazaRects = pavedPlazaRects || [];
   const inPlaza = (x, z, m = 1.0) =>
     plazaRects.some((r) => x > r.minX - m && x < r.maxX + m && z > r.minZ - m && z < r.maxZ + m);
 
-  // True only when (x, z) and its surrounding pad-meter footprint sit on a real curb island (never in a road or median)
+  // True only when (x, z) and its pad-metre surroundings sit on a built curb island (never on a road, median or park)
   const isOnCurbIsland = (x, z, pad = 0.55) => {
     const b = blockAt(x, z);
-    if (!b || b.median) return false;
+    if (!b || b.median || b.open) return false;
     if (pad <= 0) return true;
-    const b1 = blockAt(x - pad, z);
-    const b2 = blockAt(x + pad, z);
-    const b3 = blockAt(x, z - pad);
-    const b4 = blockAt(x, z + pad);
-    return !!(b1 && !b1.median && b2 && !b2.median && b3 && !b3.median && b4 && !b4.median);
+    for (const [dx, dz] of [[-pad, 0], [pad, 0], [0, -pad], [0, pad]]) {
+      const o = blockAt(x + dx, z + dz);
+      if (!o || o.median || o.open) return false;
+    }
+    return true;
   };
-
-  // True only when (x, z) is on a non-park, non-median, non-plaza sidewalk with `pad` clearance from all curbs
-  const isOnSidewalk = (x, z, pad = 0.55) => {
-    if (!isOnCurbIsland(x, z, pad)) return false;
-    const b = blockAt(x, z);
-    return !(b.park > 0.6) && !inPlaza(x, z, 1.0);
-  };
-
-  const isClearOfPoles = (x, z, minDist = 6.0) => {
-    const md2 = minDist * minDist;
-    for (let i = 0; i < placedPoles.length; i++) {
-      const dx = placedPoles[i].x - x;
-      const dz = placedPoles[i].z - z;
-      if (dx * dx + dz * dz < md2) return false;
+  // ... and off the paved squares
+  const isOnSidewalk = (x, z, pad = 0.55) => isOnCurbIsland(x, z, pad) && !inPlaza(x, z, 1.0);
+  // Signal posts may also stand on the kerbed open land (the edge of a park or a square), never on medians or roads
+  const KERBED_OPEN = new Set([LAND_CLASS.PARK, LAND_CLASS.GRASS, LAND_CLASS.PLAZA, LAND_CLASS.SPORTS, LAND_CLASS.CEMETERY]);
+  const isSignalSpot = (x, z, pad = 0.4) => {
+    for (const [dx, dz] of [[0, 0], [-pad, 0], [pad, 0], [0, -pad], [0, pad]]) {
+      const b = blockAt(x + dx, z + dz);
+      if (!b || b.median || (b.open && !KERBED_OPEN.has(b.cls))) return false;
     }
     return true;
   };
 
-  for (let a = 0; a < AVENUES.length; a++) {
-    const ave = AVENUES[a];
-    for (let s = 0; s < STREETS.length; s++) {
-      const st = STREETS[s];
-      const cornerOffsetX = ave.width * 0.5 + 1.25;
-      const cornerOffsetZ = st.width * 0.5 + 1.25;
-
-      // Place diagonal pair of traffic signal masts at NE and SW corners of every intersection
-      const corners = [
-        { sx: 1, sz: -1, armDir: -1 },
-        { sx: -1, sz: 1, armDir: 1 }
-      ];
-
-      for (const c of corners) {
-        let px = ave.x + c.sx * cornerOffsetX;
-        let pz = st.z + c.sz * cornerOffsetZ;
-        if (!isOnCurbIsland(px, pz, 0.55) || inPlaza(px, pz, 1.0)) {
-          // Try nudging slightly deeper into the block corner if clipped near the curb
-          const altX = ave.x + c.sx * (cornerOffsetX + 0.85);
-          const altZ = st.z + c.sz * (cornerOffsetZ + 0.85);
-          if (isOnCurbIsland(altX, altZ, 0.55) && !inPlaza(altX, altZ, 1.0)) {
-            px = altX;
-            pz = altZ;
-          } else {
-            continue;
-          }
+  // Spatial hash of everything standing on the sidewalks, so nothing is planted through anything else
+  const POLE_CELL = 16;
+  const poleGrid = new Map();
+  const poleKey = (ix, iz) => ix * 100003 + iz;
+  const placePole = (x, z) => {
+    const k = poleKey(Math.floor(x / POLE_CELL), Math.floor(z / POLE_CELL));
+    let list = poleGrid.get(k);
+    if (!list) poleGrid.set(k, (list = []));
+    list.push(x, z);
+  };
+  const isClearOfPoles = (x, z, minDist = 6.0) => {
+    const md2 = minDist * minDist;
+    const r = Math.ceil(minDist / POLE_CELL);
+    const ix = Math.floor(x / POLE_CELL), iz = Math.floor(z / POLE_CELL);
+    for (let i = ix - r; i <= ix + r; i++) {
+      for (let j = iz - r; j <= iz + r; j++) {
+        const list = poleGrid.get(poleKey(i, j));
+        if (!list) continue;
+        for (let k = 0; k < list.length; k += 2) {
+          const dx = list[k] - x, dz = list[k + 1] - z;
+          if (dx * dx + dz * dz < md2) return false;
         }
-        // Ensure the cantilevered mast arm actually overhangs the avenue roadway
-        if (blockAt(px + c.armDir * 3.1, pz) || !isClearOfPoles(px, pz, 6.0)) continue;
-        placedPoles.push({ x: px, z: pz });
-        addFootprint(px, pz, 0.5, 0.5);
+      }
+    }
+    return true;
+  };
+  function hashPos(x, y, z) {
+    const s = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453;
+    return s - Math.floor(s);
+  }
 
-        // Vertical pole (6.4m tall)
-        dummy.position.set(px, 3.3, pz);
-        dummy.rotation.set(0, 0, 0);
-        dummy.scale.set(0.14, 6.4, 0.14);
-        dummy.updateMatrix();
-        poleMatrices.push(dummy.matrix.clone());
-
-        // NYC DOT Green Street Name Sign Blade mounted on pole (y = 4.65m)
-        dummy.position.set(px + c.armDir * 0.68, 4.65, pz);
-        dummy.scale.set(1.38, 0.34, 0.08);
-        dummy.updateMatrix();
-        streetBladeMatrices.push(dummy.matrix.clone());
-
-        // Pedestrian "WALK / DON'T WALK" signal on the pole at crosswalk level (y = 3.15m), facing across the street
-        dummy.position.set(px + c.armDir * 0.24, 3.15, pz);
-        dummy.scale.set(1, 1, 1);
-        dummy.updateMatrix();
-        walkBoxMatrices.push(dummy.matrix.clone());
-        // These panels share the avenue WALK phase; rejected/unplaced poles never become sound sources.
-        audioSignals.push({ x: dummy.position.x, y: dummy.position.y, z: dummy.position.z, isAvenue: true });
-
-        // Cantilever horizontal mast arm reaching 6.5m over the avenue
-        const armX = px + c.armDir * 3.25;
-        dummy.position.set(armX, 6.1, pz);
-        dummy.scale.set(6.5, 0.11, 0.11);
-        dummy.updateMatrix();
-        armMatrices.push(dummy.matrix.clone());
-
-        // Intersection corner cobra-head luminaire overhanging the crosswalk & corner sidewalk
-        const cornerLampX = px + c.armDir * 1.85;
-        dummy.position.set(cornerLampX, 6.22, pz);
-        dummy.scale.set(1, 1, 1);
-        dummy.updateMatrix();
-        lampHeadMatrices.push(dummy.matrix.clone());
-        cobraLampSites.push({
-          x: cornerLampX,
-          y: 6.18,
-          z: pz,
-          tx: px + c.armDir * 2.8,
-          tz: pz - c.sz * 1.4
-        });
-
-        // Two NYC yellow signal heads hanging from the mast arm: the avenue's (3.1 m out, facing up & down the avenue)
-        // and the cross street's (5.5 m out, turned to face along the street)
-        for (const armDist of [3.1, 5.5]) {
-          dummy.position.set(px + c.armDir * armDist, 5.42, pz);
-          dummy.rotation.set(0, armDist < 4.0 ? 0 : Math.PI / 2, 0);
-          dummy.scale.set(1, 1, 1);
-          dummy.updateMatrix();
-          yellowBoxMatrices.push(dummy.matrix.clone());
-          (armDist < 4.0 ? aveLensMatrices : streetLensMatrices).push(dummy.matrix.clone());
+  // =========================================================================
+  // 1. THE STREET GRAPH: the arms of every junction (direction, width, name, which way traffic runs) and, at each,
+  //    the main road: the arms paired into roads (an arm with the one most nearly opposite it), the widest road
+  //    first — group 0 in js/road-network.js, the "avenue" phase of SIGNAL_TIMING
+  // =========================================================================
+  const graph = GEO.roadGraph;
+  const nodeCount = graph.nodes.length / 2;
+  const nodeX = (i) => graph.nodes[i * 2];
+  const nodeZ = (i) => graph.nodes[i * 2 + 1];
+  const arms = new Array(nodeCount);
+  for (let i = 0; i < nodeCount; i++) arms[i] = [];
+  for (const l of graph.links) {
+    const [a, b, nameIdx, w, lanes, dir, inner, cls, , roundabout] = l;
+    const ax = nodeX(a), az = nodeZ(a), bx = nodeX(b), bz = nodeZ(b);
+    const name = prettyName(graph.names[nameIdx]);
+    const firstX = inner.length ? inner[0] : bx, firstZ = inner.length ? inner[1] : bz;
+    const lastX = inner.length ? inner[inner.length - 2] : ax, lastZ = inner.length ? inner[inner.length - 1] : az;
+    const la = Math.hypot(firstX - ax, firstZ - az) || 1;
+    const lb = Math.hypot(lastX - bx, lastZ - bz) || 1;
+    const width = w || 6;
+    arms[a].push({ node: a, ux: (firstX - ax) / la, uz: (firstZ - az) / la, w: width, lanes, name, cls, roundabout, incoming: dir !== 1, outgoing: dir !== -1 });
+    arms[b].push({ node: b, ux: (lastX - bx) / lb, uz: (lastZ - bz) / lb, w: width, lanes, name, cls, roundabout, incoming: dir !== -1, outgoing: dir !== 1 });
+  }
+  // Marks each arm of a node with whether it belongs to the main road (the widest); returns the main road's direction
+  function markMainRoad(list) {
+    const pairs = [];
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        const d = list[i].ux * list[j].ux + list[i].uz * list[j].uz;
+        if (d < -0.82) pairs.push([d + 0.02 * Math.abs(list[i].w - list[j].w), list[i], list[j]]);
+      }
+    }
+    pairs.sort((p, q) => p[0] - q[0]);
+    const mates = new Map();
+    for (const [, a, b] of pairs) {
+      if (mates.has(a) || mates.has(b)) continue;
+      mates.set(a, b);
+      mates.set(b, a);
+    }
+    const roads = [];
+    const done = new Set();
+    for (const a of list) {
+      if (done.has(a)) continue;
+      done.add(a);
+      const mate = mates.get(a);
+      if (mate) done.add(mate);
+      const members = mate ? [a, mate] : [a];
+      roads.push({ members, rank: Math.max(...members.map((m) => m.w + m.lanes * 0.5 + (m.cls === 2 || m.cls === 1 ? 4 : 0))) });
+    }
+    roads.sort((p, q) => q.rank - p.rank);
+    for (const r of roads) for (const m of r.members) m.main = r === roads[0];
+    const m0 = roads[0].members[0];
+    return { ux: m0.ux, uz: m0.uz };
+  }
+  const mainDir = new Map(); // signalled node -> main road direction
+  const signalSet = new Set(graph.signals);
+  // Signalled nodes bucketed for the crossings' lookup
+  const SIG_CELL = 32;
+  const sigGrid = new Map();
+  for (const n of graph.signals) {
+    if (arms[n].length < 2) continue;
+    mainDir.set(n, markMainRoad(arms[n]));
+    const k = Math.floor(nodeX(n) / SIG_CELL) * 100003 + Math.floor(nodeZ(n) / SIG_CELL);
+    if (!sigGrid.has(k)) sigGrid.set(k, []);
+    sigGrid.get(k).push(n);
+  }
+  const nearestSignalNode = (x, z, r) => {
+    let best = -1, bd = r * r;
+    const ix = Math.floor(x / SIG_CELL), iz = Math.floor(z / SIG_CELL), c = Math.ceil(r / SIG_CELL);
+    for (let i = ix - c; i <= ix + c; i++) {
+      for (let j = iz - c; j <= iz + c; j++) {
+        const list = sigGrid.get(i * 100003 + j);
+        if (!list) continue;
+        for (const n of list) {
+          const d2 = (nodeX(n) - x) ** 2 + (nodeZ(n) - z) ** 2;
+          if (d2 < bd) { bd = d2; best = n; }
         }
-        dummy.rotation.set(0, 0, 0);
+      }
+    }
+    return best;
+  };
+
+  // =========================================================================
+  // 2. TRAFFIC SIGNALS: one post on the right-hand kerb corner of every approach (Spain drives on the right), its
+  //    head facing the arriving traffic; a mast arm with a second head over the wide approaches
+  // =========================================================================
+  let signalHeads = 0;
+  for (const n of graph.signals) {
+    const list = arms[n];
+    if (list.length < 2 || !mainDir.has(n)) continue;
+    const nx = nodeX(n), nz = nodeZ(n);
+    for (const arm of list) {
+      if (!arm.incoming) continue;
+      let crossHalf = 3;
+      for (const o of list) if (o !== arm) crossHalf = Math.max(crossHalf, o.w * 0.5);
+      // right of the traffic arriving along -u: (uz, -ux)
+      const rx = arm.uz, rz = -arm.ux;
+      const L = crossHalf + 1.2;
+      const R = arm.w * 0.5 + 0.75;
+      // the nearest kerb corner on the right: a little further along the approach where the crossing is wide or the
+      // corner is rounded, a little further right where a traffic island sits in the mouth
+      let px = 0, pz = 0, found = false;
+      for (let dl = 0; dl <= 15 && !found; dl += 1.5) {
+        for (const dr of [0, 0.8, 1.6, 2.6, 3.8, 5.2]) {
+          px = nx + arm.ux * (L + dl) + rx * (R + dr);
+          pz = nz + arm.uz * (L + dl) + rz * (R + dr);
+          if (isSignalSpot(px, pz, 0.4) && isClearOfPoles(px, pz, 1.5)) { found = true; break; }
+        }
+      }
+      if (!found) continue;
+      placePole(px, pz);
+      addFootprint(px, pz, 0.45, 0.45);
+      const yaw = Math.atan2(arm.ux, arm.uz); // the +z face toward where the traffic comes from
+      const tall = arm.w >= 11;
+      pushMatrix(M.signalPole, px, tall ? 3.1 : 1.9, pz, 0, 0.07, tall ? 6.2 : 3.8, 0.07);
+      // post head, hung out over the kerb toward the roadway
+      pushMatrix(M.head, px - rx * 0.3, 3.15, pz - rz * 0.3, yaw);
+      pushMatrix(arm.main ? M.mainLens : M.crossLens, px - rx * 0.3, 3.15, pz - rz * 0.3, yaw);
+      signalHeads++;
+      if (tall) {
+        const A = Math.min(arm.w * 0.45, 6.5);
+        pushMatrix(M.signalArm, px - rx * A * 0.5, 5.95, pz - rz * A * 0.5, Math.atan2(rz, -rx), A, 0.1, 0.1);
+        pushMatrix(M.head, px - rx * (A - 0.4), 5.3, pz - rz * (A - 0.4), yaw);
+        pushMatrix(arm.main ? M.mainLens : M.crossLens, px - rx * (A - 0.4), 5.3, pz - rz * (A - 0.4), yaw);
+        signalHeads++;
+      }
+      // a litter bin by most signal posts
+      if (hashPos(px, 1, pz) < 0.6) {
+        const bx = px + arm.ux * 0.9, bz = pz + arm.uz * 0.9;
+        if (isOnSidewalk(bx, bz, 0.3)) { pushMatrix(M.bin, bx, SW_TOP, bz); addFootprint(bx, bz, 0.45, 0.45); placePole(bx, bz); }
       }
     }
   }
 
   // =========================================================================
-  // 2. MID-BLOCK AVENUE & STREET ORNAMENTAL ACORN & COBRA STREETLIGHTS
-  //    Placed directly along the true curb edges of every city block (BLOCKS)
-  //    and verified with blockAt(x, z) so no pole ever stands in any roadway.
+  // 3. PEDESTRIAN SIGNALS at the signalled crossings: a post at each end, the men facing across the road. A crossing
+  //    over the junction's main road walks with the cross streets' green (isAvenue false), and vice versa
   // =========================================================================
-  const allBlocks = BLOCKS || [];
-  const detailZMin = streetZ(61);
-  const detailZMax = streetZ(14);
+  let pedHeads = 0;
+  for (const c of graph.crossings) {
+    const [cx, cz, ux, uz, w, kind] = c;
+    if (kind !== 1) continue;
+    const n = nearestSignalNode(cx, cz, 30);
+    const md = n >= 0 ? mainDir.get(n) : null;
+    const crossesMain = md ? Math.abs(md.ux * ux + md.uz * uz) > 0.7 : false;
+    const isAvenue = !crossesMain;
+    const nxv = -uz, nzv = ux; // across the road
+    for (const s of [-1, 1]) {
+      let ex = 0, ez = 0, ok = false;
+      for (const extra of [0, 0.6, 1.2, 1.9]) {
+        ex = cx + s * nxv * (w * 0.5 + 0.9 + extra);
+        ez = cz + s * nzv * (w * 0.5 + 0.9 + extra);
+        if (isSignalSpot(ex, ez, 0.3) && isClearOfPoles(ex, ez, 0.9)) { ok = true; break; }
+      }
+      if (!ok) continue;
+      placePole(ex, ez);
+      addFootprint(ex, ez, 0.3, 0.3);
+      const fx = -s * nxv, fz = -s * nzv; // facing the far kerb
+      const yaw = Math.atan2(fx, fz);
+      pushMatrix(M.pedPole, ex, 1.35, ez, 0, 0.05, 2.7, 0.05);
+      pushMatrix(M.pedHead, ex + fx * 0.12, 2.35, ez + fz * 0.12, yaw);
+      pushMatrix(isAvenue ? M.pedMainLens : M.pedCrossLens, ex + fx * 0.12, 2.35, ez + fz * 0.12, yaw);
+      audioSignals.push({ x: ex, y: 2.35, z: ez, isAvenue });
+      pedHeads++;
+    }
+  }
 
-  for (const b of allBlocks) {
-    if (!b || !b.poly || b.poly.length < 3 || b.median || b.park > 0.6) continue;
-    if (b.cz < detailZMin || b.cz > detailZMax || b.cx < -920 || b.cx > 920) continue;
+  // =========================================================================
+  // 4. STREET NAME PLAQUES on the building corner of every corner where two named streets meet: for each pair of
+  //    neighbouring arms, the kerb corner lies along their bisector, the building corner 2.4 m (the sidewalk) behind
+  //    it; one plaque per street on the facade facing that street, at 2.8 m
+  // =========================================================================
+  const atlas = new PlaqueAtlas();
+  const plaqueKeys = new Set();
+  const SIDEWALK = 2.4;
+  function addPlaque(name, x, z, yaw) {
+    const key = `${name}|${Math.round(x / 2)}|${Math.round(z / 2)}`;
+    if (plaqueKeys.has(key)) return;
+    plaqueKeys.add(key);
+    const cell = atlas.cell(name);
+    pushMatrix(M.plaque, x, 2.8, z, yaw);
+    plaqueCells.push(cell.u0, cell.v0);
+    plaqueAtlasOf.push(cell.atlas);
+  }
+  for (let n = 0; n < nodeCount; n++) {
+    const list = arms[n];
+    if (list.length < 2) continue;
+    const names = new Set();
+    for (const a of list) if (a.name && a.name !== UNNAMED) names.add(a.name);
+    if (names.size < 2) continue;
+    const nx = nodeX(n), nz = nodeZ(n);
+    const sorted = list.map((a) => ({ a, ang: Math.atan2(a.uz, a.ux) })).sort((p, q) => p.ang - q.ang);
+    for (let i = 0; i < sorted.length; i++) {
+      const A = sorted[i], B = sorted[(i + 1) % sorted.length];
+      if (A.a === B.a) continue;
+      const na = A.a.name, nb = B.a.name;
+      if (!na || !nb || na === UNNAMED || nb === UNNAMED || na === nb) continue;
+      const sector = ((B.ang - A.ang) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) || Math.PI * 2;
+      if (sector < 0.45 || sector > 3.4) continue; // no building corner in a sliver or a reflex gap
+      const mid = A.ang + sector * 0.5;
+      const bx = Math.cos(mid), bz = Math.sin(mid);
+      // the kerb corner: the first built island along the bisector
+      let blk = null, d = 0;
+      for (d = 3; d <= 30; d += 1) {
+        const b = blockAt(nx + bx * d, nz + bz * d);
+        if (b && !b.open && !b.median) { blk = b; break; }
+      }
+      if (!blk || !(blk.rects.length || (blk.frames && blk.frames.length))) continue;
+      const back = Math.min(7, SIDEWALK / Math.max(0.35, Math.sin(sector * 0.5)));
+      let cxp = nx + bx * (d + back), czp = nz + bz * (d + back);
+      if (blockAt(cxp, czp) !== blk) { cxp = nx + bx * (d + 1.2); czp = nz + bz * (d + 1.2); }
+      for (const [arm, other] of [[A.a, B.a], [B.a, A.a]]) {
+        const px0 = -arm.uz, pz0 = arm.ux;
+        const sgn = px0 * other.ux + pz0 * other.uz > 0 ? -1 : 1; // facade normal: away from the block, toward this street
+        const fnx = px0 * sgn, fnz = pz0 * sgn;
+        const x = cxp + arm.ux * 1.7 + fnx * 0.08;
+        const z = czp + arm.uz * 1.7 + fnz * 0.08;
+        if (blockAt(x - fnx * 0.5, z - fnz * 0.5) !== blk) continue; // the facade would be over the road
+        addPlaque(arm.name, x, z, Math.atan2(fnx, fnz));
+      }
+    }
+  }
 
-    const poly = b.poly;
+  // =========================================================================
+  // 5. STREETLIGHTS, TREES, BINS & BOLLARDS along every kerb edge of every built island: column luminaires along the
+  //    wider streets, posts along the residential ones, wall lanterns in the old town's lanes & the pedestrian
+  //    streets; rows of plane trees in tree pits along the streets with a roadway of 9 m or more (and a few small
+  //    ornamentals on the residential streets of the Eixample & the suburbs); bollards along the pedestrian streets
+  // =========================================================================
+  const treePositions = []; // { x, y, z, scale, species, ... }
+  const sidewalkTreePositions = []; // ... of those, the ones standing in tree pits
+  const TREE_Y = SW_TOP + 0.05;
+  const mixSpecies = (r, plane, locust) => (r < plane ? 0 : (r < plane + locust ? 1 : 2));
+  // Street trees turn in 90° steps with the crown squeezed across the sidewalk, away from the facades
+  function addStreetTree(x, z, scale, species, ux, uz, extra = {}) {
+    if (!isOnSidewalk(x, z, 0.5) || inPlaza(x, z, 1.5) || !isClearOfPoles(x, z, 2.4)) return false;
+    const q = Math.floor(hashPos(x, 8.8, z) * 3.999);
+    const alongX = Math.abs(ux) > Math.abs(uz);
+    const t = { x, y: TREE_Y, z, scale, species, yaw: q * Math.PI * 0.5, tier: 1, pitRot: Math.atan2(ux, uz), ...extra };
+    if (alongX === (q % 2 === 0)) t.sz = extra.squeeze || 0.82;
+    else t.sx = extra.squeeze || 0.82;
+    treePositions.push(t);
+    sidewalkTreePositions.push(t);
+    placePole(x, z);
+    return true;
+  }
+  const WIDE_KIND = { oldtown: 1, eixample: 1, blocs: 1, suburban: 1 };
+  let columns = 0, posts = 0, lanterns = 0, rowTrees = 0;
+  for (const s of sidewalkBlocks || []) {
+    const b = s.block;
+    const poly = s.poly;
+    if (!b || !poly || poly.length < 3 || b.median || b.open) continue;
+    const kind = blockProfile(b).kind;
+    const parking = b.cls === LAND_CLASS.PARKING && b.clsShare >= 0.5;
     for (let i = 0; i < poly.length; i++) {
       const p0 = poly[i];
       const p1 = poly[(i + 1) % poly.length];
       const dx = p1.x - p0.x;
       const dz = p1.z - p0.z;
       const len = Math.hypot(dx, dz);
-      if (len < 24) continue;
-
+      if (len < 11) continue;
       const ux = dx / len;
       const uz = dz / len;
       const mx = (p0.x + p1.x) * 0.5;
       const mz = (p0.z + p1.z) * 0.5;
-
-      // Determine inward normal (into the sidewalk block) and outward normal (into the street roadway)
+      // inward normal (into the island) and outward normal (into the roadway)
       let inx = -uz;
       let inz = ux;
       if (blockAt(mx + inx * 1.6, mz + inz * 1.6) !== b) {
@@ -350,713 +626,267 @@ function buildStreetDetails(scene) {
       if (blockAt(mx + inx * 1.6, mz + inz * 1.6) !== b) continue;
       const outX = -inx;
       const outZ = -inz;
-      // Confirm this curb edge fronts an open roadway
-      if (blockAt(mx + outX * 2.5, mz + outZ * 2.5)) continue;
+      if (blockAt(mx + outX * 2.5, mz + outZ * 2.5)) continue; // faces another island, not a roadway
 
-      const isAvenueEdge = Math.abs(uz) > 0.65;
-      if (isAvenueEdge) {
-        const armYaw = Math.atan2(-outZ, outX);
-        const cobraFracs = inx > 0 ? [0.26, 0.72] : [0.32, 0.78];
-        for (const f of cobraFracs) {
-          const cx = p0.x + dx * f;
-          const cz = p0.z + dz * f;
-          const lx = cx + inx * 1.08;
-          const lz = cz + inz * 1.08;
-          const headX = lx + outX * 2.6;
-          const headZ = lz + outZ * 2.6;
-          if (
-            !isOnSidewalk(lx, lz, 0.55) ||
-            blockAt(cx + outX * 2.5, cz + outZ * 2.5) ||
-            blockAt(headX, headZ) ||
-            !isClearOfPoles(lx, lz, 6.5)
-          ) {
-            continue;
+      const near = nearestRoads(mx + outX * 3, mz + outZ * 3, 14);
+      const road = near.length ? near[0].road : null;
+      const w = road ? road.w : 7;
+      const pedestrian = road ? road.pedestrian : false;
+      const lampType = pedestrian || w < 5.5 || (kind === 'oldtown' && w < 7) ? 'wall' : w >= 8 ? 'column' : 'post';
+      const spacing = lampType === 'column' ? 28 : lampType === 'post' ? 24 : 20;
+      const start = 6 + hashPos(p0.x, 2.2, p0.z) * 6;
+
+      // lamps
+      for (let t = start; t < len - 4; t += spacing) {
+        const cx = p0.x + ux * t;
+        const cz = p0.z + uz * t;
+        if (lampType === 'wall') {
+          // on the facade (the property line, 2.4 m behind the kerb), hanging out over the lane
+          const lx = cx + inx * SIDEWALK, lz = cz + inz * SIDEWALK;
+          if (blockAt(lx, lz) !== b || !isClearOfPoles(lx, lz, 5)) continue;
+          placePole(lx, lz);
+          pushMatrix(M.wall, lx, SW_TOP, lz, Math.atan2(outX, outZ));
+          pointSites.push({ x: lx + outX * 0.72, y: SW_TOP + 4.3, z: lz + outZ * 0.72, color: 0xffd9a0, intensity: 22, dist: 12 });
+          lanterns++;
+        } else {
+          const lx = cx + inx * 0.65, lz = cz + inz * 0.65;
+          if (!isOnSidewalk(lx, lz, 0.4) || !isClearOfPoles(lx, lz, spacing * 0.35)) continue;
+          placePole(lx, lz);
+          addFootprint(lx, lz, 0.4, 0.4);
+          if (lampType === 'column') {
+            const yaw = Math.atan2(outZ, -outX) + Math.PI; // the arm's +x toward the roadway
+            pushMatrix(M.column, lx, SW_TOP, lz, 0);
+            pushMatrix(M.columnArm, lx, SW_TOP, lz, Math.atan2(-outZ, outX));
+            spotSites.push({ x: lx + outX * 1.4, y: SW_TOP + 7.7, z: lz + outZ * 1.4, tx: lx + outX * 3.6, tz: lz + outZ * 3.6, yaw });
+            columns++;
+          } else {
+            pushMatrix(M.post, lx, SW_TOP, lz, 0);
+            pointSites.push({ x: lx, y: SW_TOP + 4.65, z: lz, color: 0xffe0aa, intensity: 28, dist: 14 });
+            posts++;
           }
-          placedPoles.push({ x: lx, z: lz });
-          addFootprint(lx, lz, 0.45, 0.45);
-
-          // Tall ornamental streetlight pole
-          dummy.position.set(lx, 4.3, lz);
-          dummy.rotation.set(0, 0, 0);
-          dummy.scale.set(0.12, 8.4, 0.12);
-          dummy.updateMatrix();
-          poleMatrices.push(dummy.matrix.clone());
-
-          // Upper luminaire bracket arm overhanging the street
-          dummy.position.set(lx + outX * 1.15, 8.2, lz + outZ * 1.15);
-          dummy.rotation.set(0, armYaw, 0);
-          dummy.scale.set(2.3, 0.09, 0.09);
-          dummy.updateMatrix();
-          armMatrices.push(dummy.matrix.clone());
-
-          // NYC DOT cobra-head LED luminaire on the end of the arm, lens facing the street
-          dummy.position.set(headX, 8.08, headZ);
-          dummy.rotation.set(0, armYaw, 0);
-          dummy.scale.set(1, 1, 1);
-          dummy.updateMatrix();
-          lampHeadMatrices.push(dummy.matrix.clone());
-          dummy.rotation.set(0, 0, 0);
-
-          cobraLampSites.push({
-            x: headX,
-            y: 8.02,
-            z: headZ,
-            tx: lx + outX * 3.4,
-            tz: lz + outZ * 3.4
-          });
+          // a litter bin next to the odd lamp
+          if (hashPos(cx, 3.3, cz) < 0.3) {
+            const bx = lx + ux * 1.0, bz = lz + uz * 1.0;
+            if (isOnSidewalk(bx, bz, 0.3)) { pushMatrix(M.bin, bx, SW_TOP, bz); addFootprint(bx, bz, 0.45, 0.45); placePole(bx, bz); }
+          }
         }
+      }
 
-        // Historic NYC cast-iron pedestrian post-top globe lightpoles along avenue sidewalks (with PointLights)
-        const pedFracs = len >= 48 ? [0.16, 0.50, 0.84] : [0.24, 0.76];
-        for (const f of pedFracs) {
-          const cx = p0.x + dx * f;
-          const cz = p0.z + dz * f;
-          const px = cx + inx * 1.42;
-          const pz = cz + inz * 1.42;
-          if (
-            !isOnSidewalk(px, pz, 0.55) ||
-            blockAt(cx + outX * 2.2, cz + outZ * 2.2) ||
-            !isClearOfPoles(px, pz, 5.2)
-          ) {
-            continue;
-          }
-          placedPoles.push({ x: px, z: pz });
-          addFootprint(px, pz, 0.4, 0.4);
-
-          dummy.position.set(px, 0.18, pz);
-          dummy.rotation.set(0, 0, 0);
-          dummy.scale.set(1, 1, 1);
-          dummy.updateMatrix();
-          pedPostMatrices.push(dummy.matrix.clone());
-          streetPointSites.push({
-            x: px,
-            y: 4.02,
-            z: pz,
-            color: 0xffe0aa,
-            intensity: 30,
-            dist: 14.5
-          });
+      // trees: rows of planes along the wide streets & the avenues, small ornamentals on residential streets
+      if (parking) continue;
+      if (!pedestrian && w >= 9) {
+        const sp = w >= 12 ? 7 : 8;
+        const thin = w >= 12 ? 0.15 : 0.25;
+        for (let t = start + 4; t < len - 5; t += sp) {
+          const x = p0.x + ux * t + inx * 1.0;
+          const z = p0.z + uz * t + inz * 1.0;
+          if (hashPos(x, 3.1, z) < thin) continue;
+          const r = hashPos(z, 2.9, x);
+          const species = w >= 12 ? mixSpecies(r, 0.7, 0.1) : mixSpecies(r, 0.55, 0.2);
+          if (addStreetTree(x, z, 0.64 + hashPos(x, 6.1, z) * 0.2, species, ux, uz)) rowTrees++;
         }
-      } else if (len >= 36) {
-        // Cross-street cast-iron pedestrian post-top globe lightpoles along north and south block curbs
-        const crossFracs = len >= 115 ? [0.20, 0.40, 0.60, 0.80] : [0.24, 0.50, 0.76];
-        for (const f of crossFracs) {
-          const cx = p0.x + dx * f;
-          const cz = p0.z + dz * f;
-          const px = cx + inx * 1.22;
-          const pz = cz + inz * 1.22;
-          if (
-            !isOnSidewalk(px, pz, 0.55) ||
-            blockAt(cx + outX * 2.2, cz + outZ * 2.2) ||
-            !isClearOfPoles(px, pz, 5.5)
-          ) {
-            continue;
-          }
-          placedPoles.push({ x: px, z: pz });
-          addFootprint(px, pz, 0.4, 0.4);
+      } else if (!pedestrian && w >= 6.5 && WIDE_KIND[kind] && hashPos(p0.x, 4.2, p1.z) < 0.3) {
+        for (let t = start + 3; t < len - 5; t += 9) {
+          const x = p0.x + ux * t + inx * 0.9;
+          const z = p0.z + uz * t + inz * 0.9;
+          if (hashPos(x, 5.1, z) < 0.3) continue;
+          if (addStreetTree(x, z, 0.48 + hashPos(x, 6.1, z) * 0.1, 1, ux, uz, { pitS: 0.7, squeeze: 0.7 })) rowTrees++;
+        }
+      }
 
-          dummy.position.set(px, 0.18, pz);
-          dummy.rotation.set(0, 0, 0);
-          dummy.scale.set(1, 1, 1);
-          dummy.updateMatrix();
-          pedPostMatrices.push(dummy.matrix.clone());
-          streetPointSites.push({
-            x: px,
-            y: 4.02,
-            z: pz,
-            color: 0xffe0aa,
-            intensity: 28,
-            dist: 14.0
-          });
+      // bollards along the pedestrian streets & the narrowest lanes (where the kerb is the only thing keeping cars off)
+      if (pedestrian || w < 4.5) {
+        for (let t = 2.5; t < len - 1.5; t += 2.5) {
+          const x = p0.x + ux * t + inx * 0.42;
+          const z = p0.z + uz * t + inz * 0.42;
+          if (blockAt(x, z) !== b || !isClearOfPoles(x, z, 0.8)) continue;
+          pushMatrix(M.bollard, x, SW_TOP, z);
         }
       }
     }
   }
 
-  function addMatrixArrayInstanced(geo, mat, matrices, castShadow = true) {
-    if (matrices.length === 0) return;
-    const inst = new THREE.InstancedMesh(geo, mat, matrices.length);
+  // =========================================================================
+  // 6. MEDIANS: lamps (double arm) & the planted medians of the avenues and the Rambla d'Ègara (rows of planes)
+  // =========================================================================
+  for (const s of sidewalkBlocks || []) {
+    const b = s.block;
+    if (!b || !b.median) continue;
+    const poly = s.poly;
+    const narrow = Math.min(b.maxX - b.minX, b.maxZ - b.minZ);
+    if (narrow < 1.4) continue;
+    // the strip's axis: its longest edge; extent along it from the vertices
+    let best = 0, ux = 1, uz = 0;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i], c = poly[(i + 1) % poly.length];
+      const L = Math.hypot(c.x - a.x, c.z - a.z);
+      if (L > best) { best = L; ux = (c.x - a.x) / L; uz = (c.z - a.z) / L; }
+    }
+    let t0 = Infinity, t1 = -Infinity;
+    for (const p of poly) {
+      const t = (p.x - b.cx) * ux + (p.z - b.cz) * uz;
+      t0 = Math.min(t0, t); t1 = Math.max(t1, t);
+    }
+    if (t1 - t0 < 16) continue;
+    const across = Math.hypot(ux, uz) ? [-uz, ux] : [0, 1];
+    for (let t = t0 + 8; t < t1 - 6; t += 30) {
+      const x = b.cx + ux * t, z = b.cz + uz * t;
+      if (blockAt(x, z) !== b) continue;
+      placePole(x, z);
+      addFootprint(x, z, 0.4, 0.4);
+      pushMatrix(M.column, x, SW_TOP, z, 0);
+      for (const sgn of [1, -1]) {
+        const ox = across[0] * sgn, oz = across[1] * sgn;
+        pushMatrix(M.columnArm, x, SW_TOP, z, Math.atan2(-oz, ox));
+        spotSites.push({ x: x + ox * 1.4, y: SW_TOP + 7.7, z: z + oz * 1.4, tx: x + ox * 3.8, tz: z + oz * 3.8 });
+      }
+    }
+    if (narrow >= 3.0) {
+      for (let t = t0 + 5; t < t1 - 4; t += 8) {
+        const x = b.cx + ux * t, z = b.cz + uz * t;
+        if (blockAt(x, z) !== b || !isClearOfPoles(x, z, 2.4)) continue;
+        if (hashPos(x, 7.7, z) < 0.12) continue;
+        placePole(x, z);
+        treePositions.push({ x, y: SW_TOP, z, scale: 0.78 + hashPos(x, 1.1, z) * 0.16, species: 0, tier: 1 });
+      }
+    }
+  }
+
+  // =========================================================================
+  // 7. THE MAPPED TREES (OSM natural=tree): on the sidewalks in tree pits, on the open land as they are; the few that
+  //    fall on a carriageway (mapping imprecision) are dropped
+  // =========================================================================
+  let realTrees = 0;
+  for (const t of STREET_TREES) {
+    const b = blockAt(t.x, t.z);
+    if (b) {
+      if (b.open) {
+        const low = b.cls === LAND_CLASS.WOOD || b.cls === LAND_CLASS.SCRUB || b.cls === LAND_CLASS.FARM;
+        treePositions.push({ x: t.x, y: low ? 0.05 : SW_TOP, z: t.z, scale: 0.8 + hashPos(t.x, 2, t.z) * 0.3, species: mixSpecies(hashPos(t.x, 3, t.z), 0.6, 0.15) });
+      } else if (b.median) {
+        treePositions.push({ x: t.x, y: SW_TOP, z: t.z, scale: 0.78, species: 0, tier: 1 });
+      } else {
+        if (!isClearOfPoles(t.x, t.z, 1.2)) continue;
+        const near = nearestRoads(t.x, t.z, 12)[0];
+        const ux = near ? near.ux : 1, uz = near ? near.uz : 0;
+        const q = Math.floor(hashPos(t.x, 8.8, t.z) * 3.999);
+        const site = { x: t.x, y: TREE_Y, z: t.z, scale: 0.68 + hashPos(t.x, 6.1, t.z) * 0.2, species: 0, yaw: q * Math.PI * 0.5, tier: 1, pitRot: Math.atan2(ux, uz), sx: 0.85 };
+        treePositions.push(site);
+        sidewalkTreePositions.push(site);
+        placePole(t.x, t.z);
+      }
+      realTrees++;
+      continue;
+    }
+    // on no island: a traffic island too small for the generator, or mis-placed in the roadway
+    const near = nearestRoads(t.x, t.z, 12);
+    if (near.length && near[0].dist < near[0].road.w * 0.5 + 0.4 && !near[0].road.pedestrian) continue;
+    treePositions.push({ x: t.x, y: 0, z: t.z, scale: 0.75, species: 0 });
+    addFootprint(t.x, t.z, 1.2, 1.2);
+    realTrees++;
+  }
+
+  // The parks, squares, woods & banks laid out by city-grid.js
+  for (const s of parkTreeSites || []) treePositions.push(s);
+
+  // =========================================================================
+  // 8. MESHES
+  // =========================================================================
+  function addMatrixArrayInstanced(geo, mat, matrices, castShadow = true, extraAttrs = null) {
+    if (matrices.length === 0) return null;
+    let g = geo;
+    if (extraAttrs) {
+      g = geo.clone();
+      for (const [name, attr] of Object.entries(extraAttrs)) g.setAttribute(name, attr);
+    }
+    const inst = new THREE.InstancedMesh(g, mat, matrices.length);
     if (castShadow && !mat.isMeshBasicNodeMaterial && mat.type !== 'MeshBasicNodeMaterial' && !mat.transparent) {
       inst.castShadow = true;
       inst.receiveShadow = true;
     }
-    for (let i = 0; i < matrices.length; i++) {
-      inst.setMatrixAt(i, matrices[i]);
-    }
+    for (let i = 0; i < matrices.length; i++) inst.setMatrixAt(i, matrices[i]);
     inst.instanceMatrix.needsUpdate = true;
+    inst.computeBoundingSphere();
     group.add(inst);
+    return inst;
   }
 
-  addMatrixArrayInstanced(unitCyl, poleMetalMat, poleMatrices);
-  addMatrixArrayInstanced(unitBox, poleMetalMat, armMatrices);
-  addMatrixArrayInstanced(signalHousingGeo, signalHousingMat, yellowBoxMatrices);
-  addMatrixArrayInstanced(signalLensGeo, aveSignalLensMat, aveLensMatrices, false);
-  addMatrixArrayInstanced(signalLensGeo, streetSignalLensMat, streetLensMatrices, false);
-  addMatrixArrayInstanced(unitBox, streetBladeMat, streetBladeMatrices);
-  addMatrixArrayInstanced(walkHousingGeo, signalHousingMat, walkBoxMatrices);
-  addMatrixArrayInstanced(walkPanelGeo, walkSignalGlow, walkBoxMatrices, false);
-  addMatrixArrayInstanced(lampHousingGeo, poleMetalMat, lampHeadMatrices);
-  addMatrixArrayInstanced(lampLensGeo, lampBulbGlow, lampHeadMatrices, false);
-  addMatrixArrayInstanced(pedLampPostGeo, poleMetalMat, pedPostMatrices);
-  addMatrixArrayInstanced(pedGlobeGeo, pedGlobeGlow, pedPostMatrices, false);
+  addMatrixArrayInstanced(unitCyl, poleMetalMat, M.signalPole);
+  addMatrixArrayInstanced(unitBox, poleMetalMat, M.signalArm);
+  addMatrixArrayInstanced(signalHousingGeo, signalHousingMat, M.head);
+  addMatrixArrayInstanced(signalLensGeo, mainSignalLensMat, M.mainLens, false);
+  addMatrixArrayInstanced(signalLensGeo, crossSignalLensMat, M.crossLens, false);
+  addMatrixArrayInstanced(unitCyl, poleMetalMat, M.pedPole);
+  addMatrixArrayInstanced(pedHousingGeo, signalHousingMat, M.pedHead);
+  addMatrixArrayInstanced(pedLensGeo, pedMainMat, M.pedMainLens, false);
+  addMatrixArrayInstanced(pedLensGeo, pedCrossMat, M.pedCrossLens, false);
+  addMatrixArrayInstanced(columnGeo, poleMetalMat, M.column);
+  addMatrixArrayInstanced(columnArmGeo, poleMetalMat, M.columnArm);
+  addMatrixArrayInstanced(columnLensGeo, lampBulbGlow, M.columnArm, false);
+  addMatrixArrayInstanced(postGeo, poleMetalMat, M.post);
+  addMatrixArrayInstanced(postLanternGeo, lanternGlow, M.post, false);
+  addMatrixArrayInstanced(wallBracketGeo, darkGreenMat, M.wall);
+  addMatrixArrayInstanced(wallLanternGeo, lanternGlow, M.wall, false);
+  addMatrixArrayInstanced(binGeo, darkGreenMat, M.bin);
+  addMatrixArrayInstanced(bollardGeo, bollardMat, M.bollard);
 
-  // =========================================================================
-  // 2B. VOLUMETRIC GOLDEN-HOUR CANYON SUN SHAFTS (GOD RAYS)
-  // =========================================================================
-  const godRayMat = createGodRayMaterial();
-  const godRayGeo = new THREE.PlaneGeometry(54, 92);
-  const canyonShafts = [
-    { x: 0,    y: 42, z: 180,  rotY: 0.32,  rotZ: -0.46 }, // 34th St & 5th Ave (Empire State Canyon)
-    { x: 0,    y: 44, z: 0,    rotY: 0.28,  rotZ: -0.44 }, // 42nd St & 5th Ave (NYPL / Bryant Park)
-    { x: 165,  y: 46, z: 0,    rotY: 0.25,  rotZ: -0.45 }, // 42nd St & Park/Lexington (Grand Central & Chrysler)
-    { x: -110, y: 42, z: -90,  rotY: 0.30,  rotZ: -0.44 }, // 47th St & 6th Ave (Rockefeller Center)
-    { x: -215, y: 40, z: -45,  rotY: 0.35,  rotZ: -0.42 }, // Times Square / Broadway Canyon
-    { x: -55,  y: 48, z: -360, rotY: 0.28,  rotZ: -0.46 }  // 59th St / Central Park South Canyon
-  ];
-  for (const cs of canyonShafts) {
-    const shaft = new THREE.Mesh(godRayGeo, godRayMat);
-    const at = fromOldFrame(cs.x, cs.z); // (authored on the former compressed grid)
-    shaft.position.set(at.x, cs.y, at.z);
-    shaft.rotation.set(0.12, cs.rotY, cs.rotZ);
-    group.add(shaft);
-  }
-
-  // =========================================================================
-  // 3. CON EDISON ORANGE/WHITE STRIPED STEAM STACKS, NYCDOT SAWHORSE BARRICADES
-  //    & BILLOWING WIND-DRIFTED VOLUMETRIC STEAM CLOUD TRAILS (REFERENCE PHOTO!)
-  // =========================================================================
-  const steamLocations = [
-    { x: 6.4,   z: 96,   windX: -1.0, windZ: -0.18 }, // 5th Ave & 37th St (Buffer zone clear of green bike lane!)
-    { x: -7.5,  z: 148,  windX: 0.95, windZ: -0.22 }, // 5th Ave near 34th St (Empire State Building)
-    { x: 6.4,   z: 48,   windX: -1.0, windZ: 0.15  }, // 5th Ave & 40th St (NYPL / Bryant Park)
-    { x: -8.0,  z: -18,  windX: 0.92, windZ: -0.20 }, // 5th Ave & 43rd St
-    { x: -206,  z: -32,  windX: 0.95, windZ: 0.22  }, // Broadway / Times Square
-    { x: -228,  z: -98,  windX: 1.0,  windZ: -0.15 }, // 7th Ave & 45th St
-    { x: -102,  z: 22,   windX: -0.9, windZ: 0.20  }, // 6th Ave & Bryant Park
-    { x: 118,   z: -12,  windX: -1.0, windZ: -0.15 }, // Park Ave & 42nd St (Grand Central)
-    { x: 212,   z: -26,  windX: 0.92, windZ: 0.18  }, // Lexington Ave & 42nd St (Chrysler Building)
-    { x: 228,   z: -195, windX: -0.9, windZ: 0.16  }, // Lexington Ave & 51st St
-    { x: -118,  z: -148, windX: 0.95, windZ: -0.18 }, // 6th Ave & 48th St (Rockefeller Center)
-    { x: 6.4,   z: 285,  windX: -0.9, windZ: -0.22 }, // 5th Ave & 26th St (Flatiron)
-    { x: 6.4,   z: 615,  windX: -0.9, windZ: 0.18  }, // 5th Ave & Washington Square
-    { x: -212,  z: 1255, windX: 0.95, windZ: -0.20 }  // One WTC / Financial District
-  ];
-  // (authored on the former compressed grid: carried onto the real streets; the Financial District one by One WTC)
-  for (const st of steamLocations) {
-    const wtc = LANDMARK_SITES['One World Trade Center'];
-    const at = st.z > 1000 && wtc ? { x: wtc.x + 48, z: wtc.z - 40 } : fromOldFrame(st.x, st.z);
-    st.x = at.x;
-    st.z = at.z;
-  }
-
-  const steamOrangeMat = new THREE.MeshStandardNodeMaterial({
-    color: 0xff5518, // High-visibility ConEd safety orange
-    roughness: 0.42
+  // Plaques: one instanced mesh per atlas, the cell of each plaque in an instanced attribute
+  const plaqueTextures = atlas.finish();
+  plaqueTextures.forEach((tex, ai) => {
+    const idx = [];
+    for (let i = 0; i < plaqueAtlasOf.length; i++) if (plaqueAtlasOf[i] === ai) idx.push(i);
+    if (!idx.length) return;
+    const cells = new THREE.InstancedBufferAttribute(new Float32Array(idx.length * 2), 2);
+    idx.forEach((i, k) => cells.setXY(k, plaqueCells[i * 2], plaqueCells[i * 2 + 1]));
+    addMatrixArrayInstanced(plaqueFaceGeo, createPlaqueMaterial(tex), idx.map((i) => M.plaque[i]), false, { aPlaqueCell: cells });
   });
-  const steamWhiteMat = new THREE.MeshStandardNodeMaterial({
-    color: 0xf4f6f8,
-    roughness: 0.45
-  });
-  const steamMat = createSteamMaterial();
-  const puffsPerStack = 36;
-  const totalSteamSprites = steamLocations.length * puffsPerStack;
-  const smokeOriginArr = new Float32Array(totalSteamSprites * 3);
-  const smokeWindArr = new Float32Array(totalSteamSprites * 3);
-  const smokeParamsArr = new Float32Array(totalSteamSprites * 4);
-  let spriteCursor = 0;
+  addMatrixArrayInstanced(plaqueFrameGeo, plaqueFrameMat, M.plaque);
 
-  const orangeMatrices = [];
-  const whiteMatrices = [];
-  const barricadeOrangeMatrices = [];
-  const barricadeWhiteMatrices = [];
-
-  for (let sIdx = 0; sIdx < steamLocations.length; sIdx++) {
-    const { x: sx, z: sz, windX, windZ } = steamLocations[sIdx];
-    addFootprint(sx, sz, 2, 2); // stack + sawhorse barricades
-
-    // 5-Band Alternating Orange & White Candy-Cane ConEd Steam Stack (height = 2.85m)
-    for (let b = 0; b < 5; b++) {
-      const bandH = 0.56;
-      const by = 0.28 + b * bandH;
-      const rScale = 0.36 - b * 0.025;
-      dummy.position.set(sx, by, sz);
-      dummy.rotation.set(0, 0, 0);
-      dummy.scale.set(rScale, bandH, rScale);
-      dummy.updateMatrix();
-      if (b % 2 === 0) {
-        orangeMatrices.push(dummy.matrix.clone());
-      } else {
-        whiteMatrices.push(dummy.matrix.clone());
-      }
-    }
-
-    // 4-Sided NYCDOT Orange-and-White Striped Wooden Sawhorse Barricades around base of stack
-    const bHalf = 0.92;
-    const sides = [
-      { ox: 0, oz: bHalf, rotY: 0 },
-      { ox: 0, oz: -bHalf, rotY: 0 },
-      { ox: bHalf, oz: 0, rotY: Math.PI * 0.5 },
-      { ox: -bHalf, oz: 0, rotY: Math.PI * 0.5 }
-    ];
-    for (const side of sides) {
-      // Barricade vertical legs
-      for (const legOff of [-0.72, 0.72]) {
-        const lx = sx + side.ox + (side.rotY === 0 ? legOff : 0);
-        const lz = sz + side.oz + (side.rotY !== 0 ? legOff : 0);
-        dummy.position.set(lx, 0.48, lz);
-        dummy.rotation.set(0, side.rotY, 0);
-        dummy.scale.set(0.08, 0.96, 0.08);
-        dummy.updateMatrix();
-        barricadeWhiteMatrices.push(dummy.matrix.clone());
-      }
-      // Top & middle striped horizontal rails
-      for (const railY of [0.82, 0.46]) {
-        for (let seg = -2; seg <= 2; seg++) {
-          const segOff = seg * 0.34;
-          const rx = sx + side.ox + (side.rotY === 0 ? segOff : 0);
-          const rz = sz + side.oz + (side.rotY !== 0 ? segOff : 0);
-          dummy.position.set(rx, railY, rz);
-          dummy.rotation.set(0, side.rotY, 0);
-          dummy.scale.set(0.34, 0.16, 0.06);
-          dummy.updateMatrix();
-          if (Math.abs(seg) % 2 === 0) {
-            barricadeOrangeMatrices.push(dummy.matrix.clone());
-          } else {
-            barricadeWhiteMatrices.push(dummy.matrix.clone());
-          }
-        }
-      }
-    }
-
-    // 36 Camera-Facing Volumetric Smoke Sprites per ConEd Steam Stack (SpriteNodeMaterial)
-    for (let p = 0; p < puffsPerStack; p++) {
-      const idx3 = spriteCursor * 3;
-      const idx4 = spriteCursor * 4;
-      const phaseOffset = (p + ((sIdx * 0.37) % 1.0)) / puffsPerStack;
-      const spinDir = p % 2 === 0 ? 1.0 : -1.0;
-      const spinSpeed = spinDir * (0.28 + ((p * 0.19 + sIdx * 0.13) % 0.45));
-      const curlSeed = (p * 1.73 + sIdx * 2.41) % (Math.PI * 2);
-      const scaleMul = 0.86 + ((p * 0.31 + sIdx * 0.17) % 0.36);
-
-      smokeOriginArr[idx3] = sx;
-      smokeOriginArr[idx3 + 1] = 2.75;
-      smokeOriginArr[idx3 + 2] = sz;
-
-      smokeWindArr[idx3] = windX;
-      smokeWindArr[idx3 + 1] = 7.4;
-      smokeWindArr[idx3 + 2] = windZ;
-
-      smokeParamsArr[idx4] = phaseOffset;
-      smokeParamsArr[idx4 + 1] = spinSpeed;
-      smokeParamsArr[idx4 + 2] = curlSeed;
-      smokeParamsArr[idx4 + 3] = scaleMul;
-      spriteCursor++;
-    }
-  }
-
-  addMatrixArrayInstanced(unitCyl, steamOrangeMat, orangeMatrices);
-  addMatrixArrayInstanced(unitCyl, steamWhiteMat, whiteMatrices);
-  addMatrixArrayInstanced(unitBox, steamOrangeMat, barricadeOrangeMatrices);
-  addMatrixArrayInstanced(unitBox, steamWhiteMat, barricadeWhiteMatrices);
-
-  const steamSpriteGeo = new THREE.PlaneGeometry(1, 1);
-  steamSpriteGeo.setAttribute('aSmokeOrigin', new THREE.InstancedBufferAttribute(smokeOriginArr, 3));
-  steamSpriteGeo.setAttribute('aSmokeWind', new THREE.InstancedBufferAttribute(smokeWindArr, 3));
-  steamSpriteGeo.setAttribute('aSmokeParams', new THREE.InstancedBufferAttribute(smokeParamsArr, 4));
-  const steamInstancedSprites = new THREE.Mesh(steamSpriteGeo, steamMat);
-  steamInstancedSprites.count = totalSteamSprites;
-  steamInstancedSprites.frustumCulled = false;
-  steamInstancedSprites.renderOrder = 2;
-  group.add(steamInstancedSprites);
-
-  // =========================================================================
-  // 4. MTA SUBWAY ENTRANCES WITH GLOWING GREEN GLOBE LAMPS
-  // =========================================================================
-  const subwayRailingMat = new THREE.MeshStandardNodeMaterial({
-    color: 0x1a3826, // Classic MTA Subway forest green ironwork
-    roughness: 0.5,
-    metalness: 0.65
-  });
-  const subwayGlobeMat = new THREE.MeshBasicNodeMaterial({ color: 0x55ff88 });
-
-  const subwayLocations = [
-    [-16.5, 162],  // 34th St - Herald Sq / 5th Ave
-    [16.5, 162],
-    [-16.5, 16],   // 42nd St - Bryant Park / 5th Ave
-    [-126.5, 16],  // 42nd St - 6th Ave
-    [-203.5, -16], // Times Sq - 42nd St
-    [-236.5, -74], // Times Sq - 45th St
-    [126.5, -16],  // Grand Central - 42nd St
-    [203.5, -16],  // Lexington Ave / Chrysler
-    [203.5, -252], // 53rd St - Lex Ave (Citigroup)
-    [-16.5, -162], // 47th-50th Sts Rockefeller Ctr
-    [-16.5, 342]   // 23rd St - Flatiron
-  ];
-
-  const subwayRailMatrices = [];
-  const subwayPostMatrices = [];
-  const subwayGlobeMatrices = [];
-
-  const snapToCurbIsland = (x, z, pad = 1.1) => {
-    if (isOnCurbIsland(x, z, pad)) return { x, z };
-    for (let r = 2; r <= 18; r += 2) {
-      for (let k = 0; k < 16; k++) {
-        const ang = (k / 16) * Math.PI * 2;
-        const nx = x + Math.cos(ang) * r;
-        const nz = z + Math.sin(ang) * r;
-        if (isOnCurbIsland(nx, nz, pad)) return { x: nx, z: nz };
-      }
-    }
-    return { x, z };
-  };
-
-  for (const [oldX, oldZ] of subwayLocations) {
-    const raw = fromOldFrame(oldX, oldZ); // (authored on the former compressed grid)
-    const { x: subX, z: subZ } = snapToCurbIsland(raw.x, raw.z, 1.2);
-    // Iron railing enclosure around sidewalk stairs
-    dummy.position.set(subX, 0.8, subZ);
-    dummy.rotation.set(0, 0, 0);
-    dummy.scale.set(2.1, 1.15, 6.2);
-    dummy.updateMatrix();
-    subwayRailMatrices.push(dummy.matrix.clone());
-    addFootprint(subX, subZ, 2.1, 6.2);
-
-    // Twin MTA Green Globe Post Lamps at stair entrance
-    for (const ox of [-0.85, 0.85]) {
-      dummy.position.set(subX + ox, 1.9, subZ + 2.9);
-      dummy.scale.set(0.09, 1.4, 0.09);
-      dummy.updateMatrix();
-      subwayPostMatrices.push(dummy.matrix.clone());
-
-      dummy.position.set(subX + ox, 2.7, subZ + 2.9);
-      dummy.scale.set(0.26, 0.26, 0.26);
-      dummy.updateMatrix();
-      subwayGlobeMatrices.push(dummy.matrix.clone());
-    }
-    streetPointSites.push({ x: subX, y: 2.75, z: subZ + 2.9, color: 0x48ff80, intensity: 18, dist: 8.5 });
-  }
-  addMatrixArrayInstanced(unitBox, subwayRailingMat, subwayRailMatrices);
-  addMatrixArrayInstanced(unitCyl, subwayRailingMat, subwayPostMatrices);
-  addMatrixArrayInstanced(new THREE.SphereGeometry(1, 10, 10), subwayGlobeMat, subwayGlobeMatrices, false);
-
-  // =========================================================================
-  // 5. NYC HOT DOG / HALAL FOOD CARTS WITH UMBRELLAS & SIDEWALK PROPS
-  // =========================================================================
-  const cartSteelMat = new THREE.MeshStandardNodeMaterial({
-    color: 0xd0d8e0,
-    roughness: 0.25,
-    metalness: 0.88
-  });
-  const umbrellaMat = new THREE.MeshStandardNodeMaterial({
-    color: 0x1e64d8, // Classic NYC blue & yellow umbrella
-    roughness: 0.6
-  });
-
-  const cartLocations = [
-    [-17, 152],   // Empire State corner
-    [-17, 25],    // NYPL / Bryant Park
-    [-127, 25],   // 6th Ave & 42nd
-    [-202, -28],  // Times Square
-    [-202, -108], // Duffy Square
-    [127, -25],   // Grand Central
-    [237, -25],   // Chrysler Building corner
-    [-17, -148],  // Rockefeller Center
-    [127, -205],  // Seagram Plaza corner
-    [-17, 325]    // Flatiron Plaza
-  ];
-
-  const cartBoxMatrices = [];
-  const umbrellaMatrices = [];
-  for (const [ox, oz] of cartLocations) {
-    const raw = fromOldFrame(ox, oz); // (authored on the former compressed grid)
-    const { x: cx, z: cz } = snapToCurbIsland(raw.x, raw.z, 1.1);
-    dummy.position.set(cx, 0.85, cz);
-    dummy.rotation.set(0, 0, 0);
-    dummy.scale.set(1.5, 1.25, 2.2);
-    dummy.updateMatrix();
-    cartBoxMatrices.push(dummy.matrix.clone());
-
-    dummy.position.set(cx, 2.55, cz);
-    dummy.scale.set(1.7, 0.75, 1.7);
-    dummy.updateMatrix();
-    umbrellaMatrices.push(dummy.matrix.clone());
-    streetPointSites.push({ x: cx, y: 2.15, z: cz, color: 0xffdf9e, intensity: 28, dist: 9.5 });
-  }
-  addMatrixArrayInstanced(unitBox, cartSteelMat, cartBoxMatrices);
-  addMatrixArrayInstanced(new THREE.ConeGeometry(1, 1, 8), umbrellaMat, umbrellaMatrices);
-
-  // =========================================================================
-  // 6. FIRE HYDRANTS & USPS BLUE MAILBOXES ALONG CURBS (INSTANCED)
-  // =========================================================================
-  const hydrantPositions = [];
-  const mailboxPositions = [];
-  for (const ave of AVENUES) {
-    for (let row = 0; row < STREETS.length - 1; row++) {
-      const zMid = (STREETS[row].z + STREETS[row + 1].z) * 0.5;
-      const h1 = [ave.x - ave.width * 0.5 - 0.8, zMid - 16];
-      const h2 = [ave.x + ave.width * 0.5 + 0.8, zMid + 16];
-      const mb = [ave.x + ave.width * 0.5 + 1.2, zMid - 22];
-      if (isOnSidewalk(h1[0], h1[1], 0.45)) hydrantPositions.push(h1);
-      if (isOnSidewalk(h2[0], h2[1], 0.45)) hydrantPositions.push(h2);
-      if (isOnSidewalk(mb[0], mb[1], 0.45)) mailboxPositions.push(mb);
-    }
-  }
-
-  const hydrantMat = new THREE.MeshStandardNodeMaterial({ color: 0xb8241e, roughness: 0.5, metalness: 0.4 });
-  const hydrantInst = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.22, 0.26, 0.85, 8), hydrantMat, hydrantPositions.length);
-  hydrantPositions.forEach(([hx, hz], i) => {
-    dummy.position.set(hx, 0.64, hz);
-    dummy.rotation.set(0, 0, 0);
-    dummy.scale.set(1, 1, 1);
-    dummy.updateMatrix();
-    hydrantInst.setMatrixAt(i, dummy.matrix);
-  });
-  hydrantInst.instanceMatrix.needsUpdate = true;
-  group.add(hydrantInst);
-
-  const uspsMat = new THREE.MeshStandardNodeMaterial({ color: 0x183c7a, roughness: 0.45, metalness: 0.35 });
-  const mailboxInst = new THREE.InstancedMesh(new THREE.BoxGeometry(0.65, 1.25, 0.65), uspsMat, mailboxPositions.length);
-  mailboxPositions.forEach(([mx, mz], i) => {
-    dummy.position.set(mx, 0.84, mz);
-    dummy.scale.set(1, 1, 1);
-    dummy.updateMatrix();
-    mailboxInst.setMatrixAt(i, dummy.matrix);
-  });
-  mailboxInst.instanceMatrix.needsUpdate = true;
-  group.add(mailboxInst);
-
-  // =========================================================================
-  // 7. LUSH TREES: PARKS & PLAZAS, CENTRAL PARK WOODLANDS, AVENUE & CROSS-STREET TREES
-  //    London planes, honey locusts & American elms (one unified trunk + crown instanced mesh per species & band)
-  // =========================================================================
-  const treePositions = []; // { x, y, z, scale, species (0 plane, 1 honey locust, 2 elm / oak) }
-  const CP_LAWN_Y = 1.19;
-  const mixSpecies = (r, plane, locust) => (r < plane ? 0 : (r < plane + locust ? 1 : 2));
-
-
-  // A. Bryant Park: double allées of London planes on the raised terraces along the Great Lawn's north & south sides
-  //    and its west end, framing the lawn the library's terrace looks out over (the lawn as fitted by landmarks.js)
-  const bpl = bryantParkLawn;
-  if (bpl) {
-    const ty = bpl.top - 0.2;
-    for (let tx = bpl.minX - 6; tx <= bpl.maxX + 6; tx += 6.5) {
-      for (const tz of [bpl.minZ - 5, bpl.minZ - 11.5, bpl.maxZ + 5, bpl.maxZ + 11.5]) {
-        treePositions.push({ x: tx, y: ty, z: tz, scale: 0.8, species: 0 });
-      }
-    }
-    for (let tz = bpl.minZ; tz <= bpl.maxZ; tz += 6.5) {
-      treePositions.push({ x: bpl.minX - 6, y: ty, z: tz, scale: 0.82, species: 0 });
-      treePositions.push({ x: bpl.minX - 12.5, y: ty, z: tz, scale: 0.76, species: 0 });
-    }
-  }
-
-  // B. Central Park (59th to 110th St, 5th Ave to Central Park West; city-config.js CENTRAL_PARK_BOUNDS), on the lawn
-  const cp = CPB;
-  // B1. Central Park South (59th St) dense woodland border
-  for (let tx = cp.minX + 8; tx <= cp.maxX - 8; tx += 9.5) {
-    treePositions.push({ x: tx, y: CP_LAWN_Y, z: cp.maxZ - 5, scale: 0.95, species: 0 });
-    treePositions.push({ x: tx + 3.5, y: CP_LAWN_Y, z: cp.maxZ - 16, scale: 1.0, species: mixSpecies(hashPos(tx, 1, 2), 0.5, 0.1) });
-    if (hashPos(tx, 7, 3) > 0.35) {
-      treePositions.push({ x: tx - 2.5, y: CP_LAWN_Y, z: cp.maxZ - 31, scale: 1.05, species: mixSpecies(hashPos(tx, 3, 4), 0.4, 0.15) });
-    }
-  }
-
-  // B2. 5th Avenue & Central Park West perimeter rows inside the park wall
-  for (let tz = cp.maxZ - 10; tz >= cp.minZ + 10; tz -= 14) {
-    treePositions.push({ x: cp.maxX - 5, y: CP_LAWN_Y, z: tz, scale: 0.92, species: mixSpecies(hashPos(tz, 1, 1), 0.55, 0.1) });
-    treePositions.push({ x: cp.maxX - 15, y: CP_LAWN_Y, z: tz - 6, scale: 0.98, species: mixSpecies(hashPos(tz, 2, 1), 0.3, 0.1) });
-    treePositions.push({ x: cp.minX + 5, y: CP_LAWN_Y, z: tz, scale: 0.92, species: mixSpecies(hashPos(tz, 3, 1), 0.55, 0.1) });
-    treePositions.push({ x: cp.minX + 15, y: CP_LAWN_Y, z: tz - 6, scale: 0.98, species: mixSpecies(hashPos(tz, 4, 1), 0.3, 0.1) });
-  }
-
-  // B3. The Mall & Literary Walk quadruple row of towering American Elms (66th to 72nd St)
-  const cpClear = centralParkClearings;
-  const mall = cpClear && cpClear.mall;
-  if (mall) {
-    for (let tz = mall.z0 + 4; tz <= mall.z1 - 4; tz += 9.5) {
-      for (const [dx, sc] of [[-16, 1.08], [-9, 1.0], [9, 1.0], [16, 1.08]]) treePositions.push({ x: mall.x + dx, y: CP_LAWN_Y, z: tz, scale: sc, species: 2 });
-    }
-  }
-
-  // B4. Woodlands: a jittered grid over the park kept clear of the meadows, water, drives, transverses, rock outcrops
-  //     & terraces (laid out by city-grid.js), densest in the Ramble (between the Lake & the 79th St transverse) & the
-  //     North Woods (north of 102nd St), with glades
-  if (cpClear) {
-    const withBox = (pts) => {
-      let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
-      for (const p of pts) { x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); z0 = Math.min(z0, p.z); z1 = Math.max(z1, p.z); }
-      return { pts, x0: x0 - 4, x1: x1 + 4, z0: z0 - 4, z1: z1 + 4 };
-    };
-    const polys = cpClear.polygons.map(withBox);
-    const drives = cpClear.drives.map((wp) => {
-      const b = withBox(wp.map(([x, z]) => ({ x, z })));
-      return { wp, x0: b.x0 - 4, x1: b.x1 + 4, z0: b.z0 - 4, z1: b.z1 + 4 };
-    });
-    const inPoly = (x, z, pts) => {
-      let inside = false;
-      for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-        const a = pts[i];
-        const b = pts[j];
-        if ((a.z > z) !== (b.z > z) && x < ((b.x - a.x) * (z - a.z)) / (b.z - a.z) + a.x) inside = !inside;
-      }
-      return inside;
-    };
-    const segDist = (px, pz, [ax, az], [bx, bz]) => {
-      const dx = bx - ax;
-      const dz = bz - az;
-      const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / (dx * dx + dz * dz || 1)));
-      return Math.hypot(px - ax - dx * t, pz - az - dz * t);
-    };
-    const blocked = (x, z) => {
-      for (const P of polys) {
-        if (x < P.x0 || x > P.x1 || z < P.z0 || z > P.z1) continue;
-        for (const [ox, oz] of [[0, 0], [3.5, 0], [-3.5, 0], [0, 3.5], [0, -3.5]]) if (inPoly(x + ox, z + oz, P.pts)) return true;
-      }
-      for (const D of drives) {
-        if (x < D.x0 || x > D.x1 || z < D.z0 || z > D.z1) continue;
-        for (let i = 0; i < D.wp.length - 1; i++) if (segDist(x, z, D.wp[i], D.wp[i + 1]) < 7.5) return true;
-      }
-      for (const r of cpClear.rects) if (x > r.minX - 2.5 && x < r.maxX + 2.5 && z > r.minZ - 2.5 && z < r.maxZ + 2.5) return true;
-      for (const c of cpClear.circles) if (Math.hypot(x - c.x, z - c.z) < c.r) return true;
-      return false;
-    };
-    const SP = 13;
-    const z79 = streetZ(79);
-    const z102 = streetZ(102);
-    for (let gz = cp.maxZ - 24; gz >= cp.minZ + 12; gz -= SP) {
-      for (let gx = cp.minX + 22; gx <= cp.maxX - 22; gx += SP) {
-        const tx = gx + (hashPos(gx, 2.1, gz) - 0.5) * SP * 0.95;
-        const tz = gz + (hashPos(gz, 5.7, gx) - 0.5) * SP * 0.95;
-        const woods = (tz > z79 && tz < z79 + 300 && tx > cp.minX + 120 && tx < cp.minX + 480) || (tz < z102 && tx < cp.minX + 520);
-        const glade = Math.sin(tx * 0.019 + 1.3) * Math.sin(tz * 0.016 + 0.4) > 0.6;
-        const grove = Math.sin(tx * 0.009 + tz * 0.004) + Math.sin(tz * 0.011 - tx * 0.006 + 2.0); // dense groves vs open scatter
-        const skip = grove > 0.6 ? 0.05 : (grove < -0.8 ? 0.55 : 0.2);
-        if (!woods && (glade || hashPos(tx, 9.1, tz) < skip)) continue;
-        if (blocked(tx, tz)) continue;
-        const r = hashPos(tz, 6.6, tx);
-        const scale = r < 0.18 ? 0.55 + r * 0.8 : 0.72 + Math.pow(r, 0.8) * 0.72; // some young understory trees
-        treePositions.push({ x: tx, y: CP_LAWN_Y, z: tz, scale, species: mixSpecies(hashPos(tx, 4.4, tz), 0.4, 0.15) });
-      }
-    }
-  }
-
-  // B5. The squares, the other parks & the plazas (sites laid out by city-grid.js)
-  for (const s of parkTreeSites || []) treePositions.push(s);
-
-  // C & D. Street trees on the raised sidewalks of every real block (city-config.js BLOCKS via the slabs city-grid.js
-  //        laid): along the avenue fronts (w / e edges) and, in the residential neighbourhoods, both curbs of the side
-  //        streets (n / s edges) — honey locusts on the narrow streets, planes, locusts & elms on the wider ones, with
-  //        random missing trees & the odd unplanted block. Never in plazas or parks.
-  const sidewalkTreePositions = [];
-  const SIDEWALK_Y = 0.22;
-  const swBlocks = sidewalkBlocks || [];
-  const onSidewalk = (x, z) => {
-    const b = blockAt(x, z);
-    return !!b && !(b.park > 0.6) && !b.median;
-  };
-  // Street trees turn in 90° steps with the crown squeezed across the sidewalk, away from the facades
-  function addStreetTree(x, z, scale, species, acrossX, extra = {}) {
-    if (!onSidewalk(x, z) || inPlaza(x, z, 1.5) || !isClearOfPoles(x, z, 2.2)) return;
-    const q = Math.floor(hashPos(x, 8.8, z) * 3.999);
-    const t = { x, y: SIDEWALK_Y, z, scale, species, yaw: q * Math.PI * 0.5, tier: acrossX ? 1 : 2, ...extra };
-    if (acrossX === (q % 2 === 0)) t.sx = extra.squeeze || 0.82;
-    else t.sz = extra.squeeze || 0.82;
-    treePositions.push(t);
-    sidewalkTreePositions.push(t);
-  }
-  const RESIDENTIAL = new Set(['uws', 'ues', 'harlem', 'morningside', 'east_harlem', 'chelsea', 'west_chelsea', 'gramercy', 'murray_hill',
-    'west_village', 'village', 'east_village', 'lower_east_side', 'turtle_bay', 'hells_kitchen', 'stuy_town', 'tribeca', 'battery_park_city',
-    'little_italy', 'chinatown', 'soho', 'hudson_square']);
-  const COMMERCIAL = new Set(['midtown', 'billionaires_row', 'garment', 'fidi', 'civic_center', 'hudson_yards', 'flatiron', 'nomad']);
-  const AVE_SP = 17;
-  const CROSS_SP = 14;
-  for (const s of swBlocks) {
-    const b = s.block;
-    if (!b || b.median || b.park > 0.6) continue;
-    const res = RESIDENTIAL.has(b.district);
-    const x0 = s.cx - s.w * 0.5;
-    const x1 = s.cx + s.w * 0.5;
-    const z0 = s.cz - s.d * 0.5;
-    const z1 = s.cz + s.d * 0.5;
-    // C. avenue fronts (the slab's short w / e edges on a grid block)
-    if (s.d >= 20) {
-      const thin = COMMERCIAL.has(b.district) ? 0.55 : 0.3;
-      for (const [x, side] of [[x0 + 1.3, -1], [x1 - 1.3, 1]]) {
-        const n = Math.floor((s.d - 10) / AVE_SP) + 1;
-        const zs = z0 + (s.d - (n - 1) * AVE_SP) * 0.5;
-        for (let i = 0; i < n; i++) {
-          const tz = zs + i * AVE_SP;
-          if (hashPos(x, 3.1, tz) < thin) continue;
-          addStreetTree(x, tz, 0.66 + hashPos(tz, 3.1, x) * 0.14, mixSpecies(hashPos(x, side, tz), 0.4, 0.35), true);
-        }
-      }
-    }
-    // D. side-street curbs (residential neighbourhoods)
-    if (!res || s.w < 24 || hashPos(s.cx, 4.2, s.cz) < 0.22) continue;
-    for (const side of [-1, 1]) {
-      const edge = side < 0 ? z0 : z1;
-      const narrow = !!blockAt(s.cx, edge + side * 14); // a block across within ~14 m: a narrow side street
-      const z = edge - side * (narrow ? 0.9 : 1.25);
-      const n = Math.floor((s.w - 7) / CROSS_SP) + 1;
-      const xs = s.cx - ((n - 1) * CROSS_SP) * 0.5;
-      for (let i = 0; i < n; i++) {
-        const x = xs + i * CROSS_SP + (hashPos(i, s.cz, side) - 0.5) * 1.6;
-        const r = hashPos(x, 6.1, z);
-        if (r < 0.32) continue;
-        const species = narrow ? 1 : mixSpecies(hashPos(z, 2.9, x), 0.4, 0.35);
-        const scale = narrow ? 0.54 + r * 0.1 : 0.6 + r * 0.24;
-        addStreetTree(x, z, scale, species, false, { pitRot: Math.PI / 2, grate: false, pitS: narrow ? 0.7 : 1, squeeze: narrow ? 0.7 : 0.82 });
-      }
-    }
-  }
-  console.info(`[streetDetails] ${treePositions.length} trees (${sidewalkTreePositions.length} street trees)`);
-
+  // Tree pits (granite surround & dark soil, cast-iron grates on the avenues), running along the kerb
   const grateMat = createTreeGrateMaterial();
-  const pitCurbMat = new THREE.MeshStandardNodeMaterial({ color: 0x484642, roughness: 0.88 });
+  const pitCurbMat = new THREE.MeshStandardNodeMaterial({ color: 0x5a5753, roughness: 0.88 });
   const pitSoilMat = new THREE.MeshStandardNodeMaterial({ color: 0x241c14, roughness: 0.96 });
-
-  // Curbside tree pit surrounds & dark soil beds, with concentric cast-iron grates on the Midtown avenues
-  // (pits run along the curb: t.pitRot = PI/2 on cross streets)
-  const pitCurbGeo = new THREE.BoxGeometry(1.7, 0.22, 2.6);
-  const pitSoilGeo = new THREE.BoxGeometry(1.35, 0.23, 2.25);
-  const pitGrateGeo = new THREE.RingGeometry(0.24, 0.82, 12, 1).rotateX(-Math.PI / 2);
-  const gratedTrees = sidewalkTreePositions.filter((t) => t.grate !== false);
-
-  const pitCurbInst = new THREE.InstancedMesh(pitCurbGeo, pitCurbMat, sidewalkTreePositions.length);
-  const pitSoilInst = new THREE.InstancedMesh(pitSoilGeo, pitSoilMat, sidewalkTreePositions.length);
-  const pitGrateInst = new THREE.InstancedMesh(pitGrateGeo, grateMat, Math.max(1, gratedTrees.length));
-  pitCurbInst.receiveShadow = true;
-  pitSoilInst.receiveShadow = true;
-  pitGrateInst.receiveShadow = true;
-  pitGrateInst.count = gratedTrees.length;
-
-  sidewalkTreePositions.forEach((t, i) => {
-    dummy.rotation.set(0, t.pitRot || 0, 0);
-    dummy.scale.set(t.pitS || 1, 1, 1);
-    dummy.position.set(t.x, 0.19, t.z);
-    dummy.updateMatrix();
-    pitCurbInst.setMatrixAt(i, dummy.matrix);
-
-    dummy.position.set(t.x, 0.20, t.z);
-    dummy.updateMatrix();
-    pitSoilInst.setMatrixAt(i, dummy.matrix);
-  });
-  gratedTrees.forEach((t, i) => {
-    dummy.rotation.set(0, 0, 0);
-    dummy.position.set(t.x, 0.225, t.z);
-    dummy.updateMatrix();
-    pitGrateInst.setMatrixAt(i, dummy.matrix);
-  });
-  pitCurbInst.instanceMatrix.needsUpdate = true;
-  pitSoilInst.instanceMatrix.needsUpdate = true;
-  pitGrateInst.instanceMatrix.needsUpdate = true;
-  for (const pit of [pitCurbInst, pitSoilInst, pitGrateInst]) pit.computeBoundingSphere();
-  group.add(pitCurbInst, pitSoilInst, pitGrateInst);
-
-  function hashPos(x, y, z) {
-    const s = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453;
-    return s - Math.floor(s);
+  const pitCurbGeo = new THREE.BoxGeometry(1.5, 0.16, 2.2);
+  const pitSoilGeo = new THREE.BoxGeometry(1.2, 0.15, 1.9);
+  const pitGrateGeo = new THREE.RingGeometry(0.24, 0.72, 12, 1).rotateX(-Math.PI / 2);
+  const gratedTrees = sidewalkTreePositions.filter((t) => t.grate !== false && (t.pitS || 1) >= 1);
+  if (sidewalkTreePositions.length) {
+    const pitCurbInst = new THREE.InstancedMesh(pitCurbGeo, pitCurbMat, sidewalkTreePositions.length);
+    const pitSoilInst = new THREE.InstancedMesh(pitSoilGeo, pitSoilMat, sidewalkTreePositions.length);
+    pitCurbInst.receiveShadow = true;
+    pitSoilInst.receiveShadow = true;
+    sidewalkTreePositions.forEach((t, i) => {
+      dummy.rotation.set(0, t.pitRot || 0, 0);
+      dummy.scale.set(t.pitS || 1, 1, t.pitS || 1);
+      dummy.position.set(t.x, SW_TOP - 0.02, t.z);
+      dummy.updateMatrix();
+      pitCurbInst.setMatrixAt(i, dummy.matrix);
+      dummy.position.set(t.x, SW_TOP - 0.03, t.z);
+      dummy.updateMatrix();
+      pitSoilInst.setMatrixAt(i, dummy.matrix);
+    });
+    pitCurbInst.instanceMatrix.needsUpdate = true;
+    pitSoilInst.instanceMatrix.needsUpdate = true;
+    pitCurbInst.computeBoundingSphere();
+    pitSoilInst.computeBoundingSphere();
+    group.add(pitCurbInst, pitSoilInst);
   }
+  if (gratedTrees.length) {
+    const pitGrateInst = new THREE.InstancedMesh(pitGrateGeo, grateMat, gratedTrees.length);
+    pitGrateInst.receiveShadow = true;
+    gratedTrees.forEach((t, i) => {
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.set(1, 1, 1);
+      dummy.position.set(t.x, SW_TOP + 0.052, t.z);
+      dummy.updateMatrix();
+      pitGrateInst.setMatrixAt(i, dummy.matrix);
+    });
+    pitGrateInst.instanceMatrix.needsUpdate = true;
+    pitGrateInst.computeBoundingSphere();
+    group.add(pitGrateInst);
+  }
+
+  console.info(`[streetDetails] ${signalHeads} signal heads, ${pedHeads} pedestrian signals, ${M.plaque.length} street plaques (${atlas.cells.size} names, ${plaqueTextures.length} atlases), ${columns} columns, ${posts} posts, ${lanterns} wall lanterns, ${M.bollard.length} bollards, ${M.bin.length} bins, ${treePositions.length} trees (${rowTrees} in rows, ${realTrees} mapped)`);
 
   // Procedural trees (js/trees.js): species skeletons with leaf-spray cards, one instanced mesh per species, variant &
   // level of detail, each tree's level following the camera
@@ -1064,18 +894,42 @@ function buildStreetDetails(scene) {
   group.add(treeField.group);
 
   // =========================================================================
-  // 8. CLUSTERED STREETLIGHTS & STREET FURNITURE LIGHT POOLS
+  // 9. POOLED STREETLIGHTS: a few dozen real lights follow the camera among the thousands of luminaires (spot lights
+  //    under the columns, point lights at the lanterns, posts & park lamps), looked up in 64 m cells
   // =========================================================================
   for (const s of parkLampSites || []) {
-    streetPointSites.push({ x: s.x, y: s.y, z: s.z, color: 0xffe4b4, intensity: 32, dist: 14.0 });
+    pointSites.push({ x: s.x, y: s.y, z: s.z, color: 0xffe4b4, intensity: 32, dist: 14.0 });
   }
 
   const STREETLIGHT_SPOT_POOL = 36;
   const STREET_POINT_POOL = 48;
   const STREETLIGHT_DIST = 115;
-  const STREETLIGHT_DIST_SQ = STREETLIGHT_DIST * STREETLIGHT_DIST;
   const STREET_POINT_DIST = 110;
-  const STREET_POINT_DIST_SQ = STREET_POINT_DIST * STREET_POINT_DIST;
+  const LIGHT_CELL = 64;
+  const bucket = (sites) => {
+    const grid = new Map();
+    for (const s of sites) {
+      const k = Math.floor(s.x / LIGHT_CELL) * 100003 + Math.floor(s.z / LIGHT_CELL);
+      let list = grid.get(k);
+      if (!list) grid.set(k, (list = []));
+      list.push(s);
+    }
+    return grid;
+  };
+  const spotGrid = bucket(spotSites);
+  const pointGrid = bucket(pointSites);
+  const gather = (grid, cx, cz, r, out) => {
+    out.length = 0;
+    const c = Math.ceil(r / LIGHT_CELL);
+    const ix = Math.floor(cx / LIGHT_CELL), iz = Math.floor(cz / LIGHT_CELL);
+    for (let i = ix - c; i <= ix + c; i++) {
+      for (let j = iz - c; j <= iz + c; j++) {
+        const list = grid.get(i * 100003 + j);
+        if (list) for (let k = 0; k < list.length; k++) out.push(list[k]);
+      }
+    }
+    return out;
+  };
 
   const streetLightsGroup = new THREE.Group();
   streetLightsGroup.name = 'StreetClusteredLights';
@@ -1083,14 +937,13 @@ function buildStreetDetails(scene) {
 
   const streetlightSpotPool = [];
   for (let i = 0; i < STREETLIGHT_SPOT_POOL; i++) {
-    // Cobra-head LED luminaire: wide downward spread (0.96 rad half-angle) illuminating both road and sidewalk
+    // Flat LED luminaire: wide downward spread lighting both the roadway and the sidewalk
     const spot = new THREE.SpotLight(0xffe8c2, 0, 25, 0.96, 0.82, 1.25);
     spot.position.set(0, -1000, 0);
     spot.target.position.set(0, -1001, 0);
     streetLightsGroup.add(spot, spot.target);
     streetlightSpotPool.push(spot);
   }
-
   const streetPointPool = [];
   for (let i = 0; i < STREET_POINT_POOL; i++) {
     const pt = new THREE.PointLight(0xffe4b4, 0, 12, 1.35);
@@ -1099,7 +952,9 @@ function buildStreetDetails(scene) {
     streetPointPool.push(pt);
   }
 
-  const activeCobras = [];
+  const nearSpots = [];
+  const nearPoints = [];
+  const activeSpots = [];
   const activePoints = [];
 
   function smoothFade(d, start, end) {
@@ -1131,30 +986,35 @@ function buildStreetDetails(scene) {
     const fwdX = -me[8];
     const fwdZ = -me[10];
 
-    let cobraCount = 0;
-    for (let i = 0; i < cobraLampSites.length; i++) {
-      const s = cobraLampSites[i];
-      const dx = s.x - cx;
-      const dz = s.z - cz;
-      const d2 = dx * dx + dz * dz + cy * cy;
-      if (d2 > STREETLIGHT_DIST_SQ) continue;
-      const d = Math.sqrt(d2);
-      const forwardDot = dx * fwdX + dz * fwdZ;
-      const effDist = d + Math.max(0, 6.0 - forwardDot) * 2.8;
-      if (effDist >= STREETLIGHT_DIST) continue;
-      s._effDist = effDist;
-      activeCobras[cobraCount++] = s;
-    }
-    activeCobras.length = cobraCount;
-    if (cobraCount > 1) activeCobras.sort((a, b) => a._effDist - b._effDist);
+    const rank = (sites, maxDist, out) => {
+      let n = 0;
+      const md2 = maxDist * maxDist;
+      for (let i = 0; i < sites.length; i++) {
+        const s = sites[i];
+        const dx = s.x - cx;
+        const dz = s.z - cz;
+        const d2 = dx * dx + dz * dz + cy * cy;
+        if (d2 > md2) continue;
+        const d = Math.sqrt(d2);
+        const forwardDot = dx * fwdX + dz * fwdZ;
+        const effDist = d + Math.max(0, 6.0 - forwardDot) * 2.8;
+        if (effDist >= maxDist) continue;
+        s._effDist = effDist;
+        out[n++] = s;
+      }
+      out.length = n;
+      if (n > 1) out.sort((a, b) => a._effDist - b._effDist);
+      return n;
+    };
 
-    const cobraCutoff = cobraCount > STREETLIGHT_SPOT_POOL
-      ? Math.min(STREETLIGHT_DIST, activeCobras[STREETLIGHT_SPOT_POOL]._effDist)
+    const spotCount = rank(gather(spotGrid, cx, cz, STREETLIGHT_DIST, nearSpots), STREETLIGHT_DIST, activeSpots);
+    const spotCutoff = spotCount > STREETLIGHT_SPOT_POOL
+      ? Math.min(STREETLIGHT_DIST, activeSpots[STREETLIGHT_SPOT_POOL]._effDist)
       : STREETLIGHT_DIST;
-    const spotUsed = Math.min(cobraCount, STREETLIGHT_SPOT_POOL);
+    const spotUsed = Math.min(spotCount, STREETLIGHT_SPOT_POOL);
     for (let i = 0; i < spotUsed; i++) {
-      const s = activeCobras[i];
-      const fade = smoothFade(s._effDist, cobraCutoff * 0.62, cobraCutoff);
+      const s = activeSpots[i];
+      const fade = smoothFade(s._effDist, spotCutoff * 0.62, spotCutoff);
       const spot = streetlightSpotPool[i];
       spot.position.set(s.x, s.y, s.z);
       spot.target.position.set(s.tx, 0.0, s.tz);
@@ -1166,23 +1026,7 @@ function buildStreetDetails(scene) {
       streetlightSpotPool[i].position.set(0, -1000, 0);
     }
 
-    let ptCount = 0;
-    for (let i = 0; i < streetPointSites.length; i++) {
-      const s = streetPointSites[i];
-      const dx = s.x - cx;
-      const dz = s.z - cz;
-      const d2 = dx * dx + dz * dz + cy * cy;
-      if (d2 > STREET_POINT_DIST_SQ) continue;
-      const d = Math.sqrt(d2);
-      const forwardDot = dx * fwdX + dz * fwdZ;
-      const effDist = d + Math.max(0, 6.0 - forwardDot) * 2.8;
-      if (effDist >= STREET_POINT_DIST) continue;
-      s._effDist = effDist;
-      activePoints[ptCount++] = s;
-    }
-    activePoints.length = ptCount;
-    if (ptCount > 1) activePoints.sort((a, b) => a._effDist - b._effDist);
-
+    const ptCount = rank(gather(pointGrid, cx, cz, STREET_POINT_DIST, nearPoints), STREET_POINT_DIST, activePoints);
     const ptCutoff = ptCount > STREET_POINT_POOL
       ? Math.min(STREET_POINT_DIST, activePoints[STREET_POINT_POOL]._effDist)
       : STREET_POINT_DIST;

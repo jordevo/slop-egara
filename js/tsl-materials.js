@@ -56,14 +56,7 @@ import {
   specularColorBlended,
   specularF90
 } from 'three/tsl';
-import {
-  CENTRAL_PARK_BOUNDS,
-  ISLAND_BOUNDS,
-  getIslandBoundsAtZ,
-  NJ_SHORELINE_POLYGON,
-  LONG_ISLAND_POLYGONS,
-  streetZ
-} from './city-config.js';
+import { ISLAND_BOUNDS, getIslandBoundsAtZ } from './city-config.js';
 
 // js/tsl-materials.js
 // Photorealistic TSL (Three.js Shading Language) procedural shaders for Three.js r186 WebGPURenderer
@@ -162,16 +155,14 @@ const filteredPulse = Fn(([x, a, b, w]) => {
 
 /**
  * Occlusion-Aware Urban Canyon Sky Visibility (aoNode)
- * Models how Manhattan street canyons occlude overhead sky irradiance near the street floor (y = 0..65m),
- * while opening up in Central Park and on upper tower shafts.
+ * Models how street canyons occlude overhead sky irradiance near the street floor (y = 0..65m), opening up on upper
+ * tower shafts.
  */
 const canyonSkyAONode = Fn(() => {
   const wp = positionWorld;
-  // Open sky inside Central Park (city-config.js CENTRAL_PARK_BOUNDS, 5th Ave to Central Park West, 59th to 110th St)
-  const cp = CENTRAL_PARK_BOUNDS;
-  const inParkX = smoothstep(cp.minX - 10.0, cp.minX + 20.0, wp.x).mul(float(1.0).sub(smoothstep(cp.maxX - 20.0, cp.maxX + 10.0, wp.x)));
-  const inParkZ = smoothstep(cp.minZ - 10.0, cp.minZ + 30.0, wp.z).mul(float(1.0).sub(smoothstep(cp.maxZ - 30.0, cp.maxZ + 10.0, wp.z)));
-  const inPark = inParkX.mul(inParkZ);
+  // Terrassa's streets are narrower and its buildings lower than Manhattan's, but its old town & Eixample streets are
+  // still canyons of 6-9 m between 4-6 storey walls: the same curve applies. No big open park rectangle to exempt.
+  const inPark = float(0.0);
 
   const heightOpenness = smoothstep(0.0, 68.0, wp.y);
   const streetCrevice = smoothstep(0.0, 7.5, wp.y).mul(0.22).add(0.78);
@@ -2554,8 +2545,9 @@ function createWaterMaterial() {
   const westShore = [], eastShore = [];
   for (let z = IB.minZ - 900; z <= IB.maxZ + 900; z += 900) {
     const s = getIslandBoundsAtZ(Math.max(IB.minZ, Math.min(IB.maxZ, z)));
-    const w = crossings([NJ_SHORELINE_POLYGON], z).filter((x) => x < s.westX - 150);
-    const e = crossings(LONG_ISLAND_POLYGONS || [], z).filter((x) => x > s.eastX + 100);
+    // Terrassa has no rivers with a far shore: the lit horizon beyond the detailed area is the surrounding towns' glow
+    const w = [];
+    const e = [];
     westShore.push([z, w.length ? Math.max(...w) : s.westX - 1300]);
     eastShore.push([z, e.length ? Math.min(...e) : s.eastX + 900]);
   }
@@ -2579,8 +2571,10 @@ function createWaterMaterial() {
     }
     return terms[0];
   };
-  const CPB = CENTRAL_PARK_BOUNDS;
-  const zSt = (n) => streetZ(n);
+  // No park lakes in Terrassa (the rieres are channels): the lake branch below never triggers, its box sits far away
+  const CPB = { minX: 1e6, maxX: 1e6 + 1, minZ: 1e6, maxZ: 1e6 + 1 };
+  // Skyline heights along z: the centre (Plaça Vella / Rambla d'Ègara / Mútua, z ≈ -800..600) stands tallest
+  const zSt = (n) => (42 - n) * 20;
   mat.emissiveNode = Fn(() => {
     const night = smoothstep(0.55, 1.35, cityUniforms.uInteriorGlow);
     const P = positionWorld.xz;

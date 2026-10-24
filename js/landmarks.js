@@ -1,1071 +1,1114 @@
 import * as THREE from 'three/webgpu';
-import { getBlockBounds, LANDMARK_SITES, BLOCKS } from './city-config.js';
-import {
-  createPreWarBuildingMaterial,
-  createCurtainWallMaterial,
-  createFacadeBoxes,
-  createChryslerCrownMaterial,
-  createBillboardMaterial
-} from './tsl-materials.js';
-import { batchStaticGroupMeshes } from './city-grid.js';
-
-let bryantParkLawn;
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { LANDMARK_SITES, MODELLED_LANDMARKS, nearestRoads } from './city-config.js';
+import { createPreWarBuildingMaterial } from './tsl-materials.js';
 
 // js/landmarks.js
-// Custom architectural 3D models for Midtown Manhattan's iconic landmarks
+// Terrassa's landmarks, built from their real OpenStreetMap footprints (city-config.js LANDMARK_SITES: outline `ring`
+// in world metres, `h` when OSM knows the height, `kind`). Every landmark named in MODELLED_LANDMARKS is built here, on
+// its exact outline, in one of two ways:
+//   1. the generic path: the outline extruded to its height (OSM, else a per-kind default) with a ground storey of
+//      plain stone pierced by arched portals, windowed upper storeys in a world-space facade material (windows follow
+//      positionWorld, like the original's landmark tiers), a string course, cornice(s), a parapet or a tiled roof;
+//   2. a bespoke low-poly model in the spirit of the original's Chrysler / Empire State: the Catedral, the Masia Freixa,
+//      the Torre del Palau, the Cartoixa, the Mercat, the town halls, the mNACTEC mill, the Teatre Principal, the three
+//      churches of the Seu d'Ègara, the Mútua tower, the Estadi Olímpic, the stations, the chimneys & the carillon.
+// Roofs follow the real outline too: a pitched (or hipped) roof is the outline clipped into planar facets, each lifted
+// by a linear height field, with gable skirts along the walls; the mill's sawtooth is the same trick tooth by tooth.
+// All geometry is baked in world space and merged into one mesh per material (scene-culling.js cuts the batches into
+// cells), so the whole set costs a few dozen draw calls. Colliders are axis-aligned boxes tiling the outline.
+// Fidelity notes per landmark: HOW_TO_IMPROVE.md §4.6.
 
-function buildLandmarks(scene) {
-  const group = new THREE.Group();
-  group.name = 'ManhattanLandmarks';
-  const colliders = [];
+const GROUP_NAME = 'TerrassaLandmarks';
+// The mNACTEC's footprint is tagged with the museum's name in OSM; the mill it occupies is listed under its own name
+const VAPOR_NAMES = ['Vapor Aymerich, Amat i Jover', 'Museu Nacional de la Ciència i de la Tècnica de Catalunya'];
 
-  const limestoneTrimMat = new THREE.MeshStandardNodeMaterial({
-    color: 0xdad0bc,
-    roughness: 0.68,
-    metalness: 0.12
+// ---------------------------------------------------------------------------------------------------------------------
+// 2D outline helpers ({x, z} rings, counter-clockwise so the outward normal of an edge a→b is (dz, -dx))
+// ---------------------------------------------------------------------------------------------------------------------
+function signedArea(ring) {
+  let a = 0;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) a += ring[j].x * ring[i].z - ring[i].x * ring[j].z;
+  return a / 2;
+}
+/** A clean copy of an outline: no repeated points, no closing duplicate, counter-clockwise */
+function cleanRing(ring) {
+  const out = [];
+  for (const p of ring) {
+    const q = out[out.length - 1];
+    if (!q || Math.hypot(p.x - q.x, p.z - q.z) > 0.05) out.push({ x: p.x, z: p.z });
+  }
+  if (out.length > 1 && Math.hypot(out[0].x - out[out.length - 1].x, out[0].z - out[out.length - 1].z) <= 0.05) out.pop();
+  if (out.length < 3) return null;
+  return signedArea(out) < 0 ? out.reverse() : out;
+}
+function centroidOf(ring) {
+  let a = 0, cx = 0, cz = 0;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const c = ring[j].x * ring[i].z - ring[i].x * ring[j].z;
+    a += c; cx += (ring[j].x + ring[i].x) * c; cz += (ring[j].z + ring[i].z) * c;
+  }
+  if (Math.abs(a) < 1e-6) return { x: ring[0].x, z: ring[0].z };
+  return { x: cx / (3 * a), z: cz / (3 * a) };
+}
+function bboxOf(ring) {
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const p of ring) { minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x); minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z); }
+  return { minX, maxX, minZ, maxZ };
+}
+function inRing(ring, x, z) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[i], b = ring[j];
+    if ((a.z > z) !== (b.z > z) && x < ((b.x - a.x) * (z - a.z)) / (b.z - a.z) + a.x) inside = !inside;
+  }
+  return inside;
+}
+/** Distance from (x, z) to the outline's edges */
+function distToRing(ring, x, z) {
+  let best = Infinity;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[j], b = ring[i];
+    const dx = b.x - a.x, dz = b.z - a.z;
+    const L2 = dx * dx + dz * dz || 1e-9;
+    const t = Math.max(0, Math.min(1, ((x - a.x) * dx + (z - a.z) * dz) / L2));
+    best = Math.min(best, Math.hypot(a.x + t * dx - x, a.z + t * dz - z));
+  }
+  return best;
+}
+/** Clearance of a point inside the outline (0 outside) */
+const clearance = (ring, x, z) => (inRing(ring, x, z) ? distToRing(ring, x, z) : 0);
+/** The edges of an outline: start, end, length, unit direction & outward normal */
+function edgesOf(ring) {
+  const out = [];
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i], b = ring[(i + 1) % ring.length];
+    const len = Math.hypot(b.x - a.x, b.z - a.z) || 1e-9;
+    const dx = (b.x - a.x) / len, dz = (b.z - a.z) / len;
+    out.push({ i, a, b, len, dx, dz, nx: dz, nz: -dx, mx: (a.x + b.x) / 2, mz: (a.z + b.z) / 2 });
+  }
+  return out;
+}
+/** The outline moved outward by `d` (inward when negative, mitred corners); null when an inward offset collapses it */
+function offsetRing(ring, d) {
+  const E = edgesOf(ring);
+  const n = ring.length;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const e1 = E[(i - 1 + n) % n], e2 = E[i];
+    const dot = e1.nx * e2.nx + e1.nz * e2.nz;
+    const k = d / Math.max(0.3, 1 + dot);
+    out.push({ x: ring[i].x + (e1.nx + e2.nx) * k, z: ring[i].z + (e1.nz + e2.nz) * k });
+  }
+  if (d < 0) {
+    if (signedArea(out) < 0.2 * signedArea(ring)) return null;
+    const F = edgesOf(out);
+    for (let i = 0; i < n; i++) if (E[i].dx * F[i].dx + E[i].dz * F[i].dz < 0.2) return null;
+  }
+  return out;
+}
+/** A convex outline drawn `d` metres towards its centroid at every vertex (terraces of an oval: never collapses) */
+function shrinkRing(ring, d) {
+  const c = centroidOf(ring);
+  return ring.map((p) => {
+    const r = Math.hypot(p.x - c.x, p.z - c.z) || 1;
+    const k = Math.max(0.05, 1 - d / r);
+    return { x: c.x + (p.x - c.x) * k, z: c.z + (p.z - c.z) * k };
   });
-  const stainlessSteelMat = new THREE.MeshStandardNodeMaterial({
-    color: 0xe2ebf4,
-    metalness: 0.88,
-    roughness: 0.12
-  });
-  const chryslerCrownMat = createChryslerCrownMaterial();
-  const darkBronzeFrameMat = new THREE.MeshStandardNodeMaterial({
-    color: 0x26221e,
-    roughness: 0.36,
-    metalness: 0.72
-  });
-  const copperRoofMat = new THREE.MeshStandardNodeMaterial({
-    color: 0x4b8770,
-    roughness: 0.52,
-    metalness: 0.28
-  });
-  const beaconMat = new THREE.MeshBasicNodeMaterial({
-    color: 0xff2b2b
-  });
-  const warmFloodMat = new THREE.MeshStandardNodeMaterial({
-    color: 0xffe8be,
-    emissive: 0xffc870,
-    emissiveIntensity: 1.35,
-    roughness: 0.28
-  });
-
-  // Illuminated MetLife crown sign canvas texture
-  const metlifeSignCanvas = document.createElement('canvas');
-  metlifeSignCanvas.width = 512;
-  metlifeSignCanvas.height = 128;
-  const mlCtx = metlifeSignCanvas.getContext('2d');
-  mlCtx.fillStyle = '#24221f';
-  mlCtx.fillRect(0, 0, 512, 128);
-  mlCtx.strokeStyle = '#6e665c';
-  mlCtx.lineWidth = 6;
-  mlCtx.strokeRect(4, 4, 504, 120);
-  mlCtx.fillStyle = '#fff5dc';
-  mlCtx.font = '900 76px Inter, Arial, sans-serif';
-  mlCtx.textAlign = 'center';
-  mlCtx.textBaseline = 'middle';
-  mlCtx.fillText('METLIFE', 256, 68);
-  const metlifeSignTex = new THREE.CanvasTexture(metlifeSignCanvas);
-  metlifeSignTex.colorSpace = THREE.SRGBColorSpace;
-  const metlifeSignMat = new THREE.MeshBasicNodeMaterial({ map: metlifeSignTex });
-
-  // Shared canonical landmark facade TSL materials (avoids compiling 13 separate WGSL pipelines)
-  const LIMESTONE_CROWN = {
-    stoneColor: 0xdad0bc,
-    trimColor: 0xa89e8a,
-    windowGlassColor: 0x1a2836,
-    windowWidth: 2.5,
-    floorHeight: 3.6,
-    litProbability: 0.58,
-    warmth: 0.82,
-    crownGlowHeight: 185.0,
-    crownGlowColor: 0xffd584,
-    seed: 19.31
+}
+/** The convex hull of an outline (monotone chain), counter-clockwise */
+function convexHull(ring) {
+  const pts = ring.slice().sort((p, q) => p.x - q.x || p.z - q.z);
+  const cross = (o, a, b) => (a.x - o.x) * (b.z - o.z) - (a.z - o.z) * (b.x - o.x);
+  const lower = [], upper = [];
+  for (const p of pts) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop(); lower.push(p); }
+  for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop(); upper.push(p); }
+  return cleanRing([...lower.slice(0, -1), ...upper.slice(0, -1)]);
+}
+/** The part of a polygon on the side nx·x + nz·z ≥ c (Sutherland–Hodgman) */
+function clipPoly(pts, nx, nz, c) {
+  const out = [];
+  const side = (p) => nx * p.x + nz * p.z - c;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    const sa = side(a), sb = side(b);
+    if (sa >= 0) out.push(a);
+    if ((sa >= 0) !== (sb >= 0)) {
+      const t = sa / (sa - sb);
+      out.push({ x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t });
+    }
+  }
+  return out.length >= 3 ? out : [];
+}
+/**
+ * The outline's local frame: its minimum-area bounding rectangle, u along the long side (w), v across (d).
+ *   world = c + u·(cos θ, sin θ) + v·(−sin θ, cos θ)
+ */
+function frameOf(ring) {
+  let best = null;
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i], b = ring[(i + 1) % ring.length];
+    const th = Math.atan2(b.z - a.z, b.x - a.x);
+    const c = Math.cos(th), s = Math.sin(th);
+    let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+    for (const p of ring) {
+      const u = p.x * c + p.z * s, v = -p.x * s + p.z * c;
+      u0 = Math.min(u0, u); u1 = Math.max(u1, u); v0 = Math.min(v0, v); v1 = Math.max(v1, v);
+    }
+    const area = (u1 - u0) * (v1 - v0);
+    if (!best || area < best.area) best = { area, th, w: u1 - u0, d: v1 - v0, cu: (u0 + u1) / 2, cv: (v0 + v1) / 2 };
+  }
+  let { th, w, d, cu, cv } = best;
+  if (d > w) { // the long side along u
+    [w, d] = [d, w];
+    [cu, cv] = [cv, -cu];
+    th += Math.PI / 2;
+  }
+  const c = Math.cos(th), s = Math.sin(th);
+  const f = {
+    th, w, d, c, s,
+    cx: cu * c - cv * s,
+    cz: cu * s + cv * c,
+    toLocal(p) { const dx = p.x - f.cx, dz = p.z - f.cz; return { x: dx * c + dz * s, z: -dx * s + dz * c }; },
+    toWorld(u, v) { return { x: f.cx + u * c - v * s, z: f.cz + u * s + v * c }; },
+    matrix(u = 0, y = 0, v = 0) {
+      const p = f.toWorld(u, v);
+      return new THREE.Matrix4().makeTranslation(p.x, y, p.z).multiply(new THREE.Matrix4().makeRotationY(-th));
+    }
   };
-  const MARBLE_STONE = {
-    stoneColor: 0xe6e0d4,
-    trimColor: 0xa09888,
-    windowGlassColor: 0x1a2634,
-    windowWidth: 2.4,
-    floorHeight: 3.6,
-    litProbability: 0.60,
-    warmth: 0.82,
-    crownGlowHeight: 152.0,
-    seed: 30.19
-  };
-  const SILVER_CURTAIN = {
-    glassTint: 0x1e3e5a,
-    frameTint: 0xc8d2dc,
-    windowWidth: 2.8,
-    floorHeight: 4.0,
-    litProbability: 0.62,
-    warmth: 0.52,
-    reflectivity: 0.94,
-    seed: 77.4
-  };
-  const BRONZE_CURTAIN = {
-    glassTint: 0x242a32,
-    frameTint: 0x48423c,
-    windowWidth: 2.5,
-    floorHeight: 3.7,
-    litProbability: 0.66,
-    warmth: 0.72,
-    reflectivity: 0.88,
-    seed: 58.2
-  };
-  const landmarkLimestoneCrownMat = createPreWarBuildingMaterial(LIMESTONE_CROWN);
-  const landmarkMarbleStoneMat = createPreWarBuildingMaterial(MARBLE_STONE);
-  const landmarkSilverCurtainMat = createCurtainWallMaterial(SILVER_CURTAIN);
-  const landmarkBronzeCurtainMat = createCurtainWallMaterial(BRONZE_CURTAIN);
-  // Their box-local twins: box-shaped parts are re-emitted as facade boxes at the end (see below)
-  const boxLocalTwins = new Map([
-    [landmarkLimestoneCrownMat, createPreWarBuildingMaterial({ ...LIMESTONE_CROWN, boxLocal: true })],
-    [landmarkMarbleStoneMat, createPreWarBuildingMaterial({ ...MARBLE_STONE, boxLocal: true })],
-    [landmarkSilverCurtainMat, createCurtainWallMaterial({ ...SILVER_CURTAIN, boxLocal: true })],
-    [landmarkBronzeCurtainMat, createCurtainWallMaterial({ ...BRONZE_CURTAIN, boxLocal: true })]
-  ]);
-
-  // -------------------------------------------------------------------------------------------------------------------
-  // Every landmark is modelled around a local origin, then fitted onto its real lot (city-config.js LANDMARK_SITES: the
-  // OpenStreetMap outline's grid-aligned box): scaled up to its real height (as wide as the real outline allows, about
-  // the model's centre) and moved so its centre stands on the outline's centre. Its colliders follow.
-  // -------------------------------------------------------------------------------------------------------------------
-  function fitToSite(objs, site, c0, { height, horizontal, stretch = false, offset = [0, 0] } = {}) {
-    if (!site) return;
-    const box = new THREE.Box3();
-    for (const o of objs) {
-      o.updateMatrixWorld(true);
-      box.expandByObject(o);
-    }
-    const size = box.getSize(new THREE.Vector3());
-    const c = box.getCenter(new THREE.Vector3());
-    const sy = height ? height / size.y : 1;
-    let sx;
-    let sz;
-    if (stretch) {
-      // fill the site's box exactly (parks & plazas)
-      sx = site.w / size.x;
-      sz = site.d / size.z;
-    } else {
-      // as tall as the real building, but never wider than its real outline (+6%) in either direction
-      const fit = Math.min(site.w / size.x, site.d / size.z) * 1.06;
-      sx = sz = horizontal ?? Math.min(sy, fit);
-    }
-    const tx = site.x + offset[0];
-    const tz = site.z + offset[1];
-    for (const o of objs) {
-      o.position.set(tx + (o.position.x - c.x) * sx, o.position.y * sy, tz + (o.position.z - c.z) * sz);
-      o.scale.multiply(new THREE.Vector3(sx, sy, sz));
-    }
-    for (let i = c0; i < colliders.length; i++) {
-      const k = colliders[i];
-      const x0 = tx + (k.minX - c.x) * sx;
-      const x1 = tx + (k.maxX - c.x) * sx;
-      const z0 = tz + (k.minZ - c.z) * sz;
-      const z1 = tz + (k.maxZ - c.z) * sz;
-      k.minX = Math.min(x0, x1);
-      k.maxX = Math.max(x0, x1);
-      k.minZ = Math.min(z0, z1);
-      k.maxZ = Math.max(z0, z1);
-      k.maxY *= sy;
-    }
-  }
-  const site = (name) => LANDMARK_SITES[name];
-  // A site spanning several real outlines (Grand Central + the MetLife Building over it)
-  const unionSite = (...names) => {
-    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
-    for (const n of names) {
-      const t = LANDMARK_SITES[n];
-      if (!t) continue;
-      x0 = Math.min(x0, t.x - t.w / 2); x1 = Math.max(x1, t.x + t.w / 2);
-      z0 = Math.min(z0, t.z - t.d / 2); z1 = Math.max(z1, t.z + t.d / 2);
-    }
-    return { x: (x0 + x1) / 2, z: (z0 + z1) / 2, w: x1 - x0, d: z1 - z0 };
-  };
-  // A park block's curb island as a site (Bryant Park & the library)
-  const blockSite = (parkName) => {
-    const b = BLOCKS.filter((q) => q.parkName === parkName && !q.median).sort((p, q) => q.area - p.area)[0];
-    return b && { x: (b.minX + b.maxX) / 2, z: (b.minZ + b.maxZ) / 2, w: b.maxX - b.minX - 9.2, d: b.maxZ - b.minZ - 9.2 };
-  };
-
-  // =========================================================================
-  // 1. EMPIRE STATE BUILDING (Col 2, Row 5: 5th Ave & 34th St)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const b = getBlockBounds(2, 5);
-    const esb = new THREE.Group();
-    esb.position.set(b.cx, 0, b.cz);
-
-    const esbMat = landmarkLimestoneCrownMat;
-
-    const podium = new THREE.Mesh(new THREE.BoxGeometry(68, 22, 50), esbMat);
-    podium.position.y = 11;
-    podium.castShadow = true;
-    podium.receiveShadow = true;
-    esb.add(podium);
-
-    const portal = new THREE.Mesh(new THREE.BoxGeometry(3.2, 14, 12), limestoneTrimMat);
-    portal.position.set(34.2, 7, 0);
-    esb.add(portal);
-
-    const tier1 = new THREE.Mesh(new THREE.BoxGeometry(54, 34, 38), esbMat);
-    tier1.position.y = 22 + 17;
-    tier1.castShadow = true;
-    tier1.receiveShadow = true;
-    esb.add(tier1);
-
-    const tier2 = new THREE.Mesh(new THREE.BoxGeometry(44, 28, 32), esbMat);
-    tier2.position.y = 56 + 14;
-    tier2.castShadow = true;
-    tier2.receiveShadow = true;
-    esb.add(tier2);
-
-    const mainShaft = new THREE.Mesh(new THREE.BoxGeometry(35, 112, 26), esbMat);
-    mainShaft.position.y = 84 + 56;
-    mainShaft.castShadow = true;
-    mainShaft.receiveShadow = true;
-    esb.add(mainShaft);
-
-    for (const sx of [-18.5, 18.5]) {
-      const wing = new THREE.Mesh(new THREE.BoxGeometry(4.5, 96, 16), esbMat);
-      wing.position.set(sx, 84 + 48, 0);
-      wing.castShadow = true;
-      wing.receiveShadow = true;
-      esb.add(wing);
-    }
-
-    const tier3 = new THREE.Mesh(new THREE.BoxGeometry(29, 24, 21), esbMat);
-    tier3.position.y = 196 + 12;
-    tier3.castShadow = true;
-    esb.add(tier3);
-
-    const tier4 = new THREE.Mesh(new THREE.BoxGeometry(23, 18, 17), esbMat);
-    tier4.position.y = 220 + 9;
-    tier4.castShadow = true;
-    esb.add(tier4);
-
-    // 86th-Floor Outdoor Observation Deck Terrace, Parapet Railing & Mullioned Glass Core
-    const obsTerrace = new THREE.Mesh(new THREE.BoxGeometry(23.8, 1.1, 17.8), limestoneTrimMat);
-    obsTerrace.position.y = 238.4;
-    esb.add(obsTerrace);
-
-    for (const pz of [-8.6, 8.6]) {
-      const railZ = new THREE.Mesh(new THREE.BoxGeometry(23.6, 1.25, 0.32), stainlessSteelMat);
-      railZ.position.set(0, 239.5, pz);
-      esb.add(railZ);
-    }
-    for (const px of [-11.6, 11.6]) {
-      const railX = new THREE.Mesh(new THREE.BoxGeometry(0.32, 1.25, 17.6), stainlessSteelMat);
-      railX.position.set(px, 239.5, 0);
-      esb.add(railX);
-    }
-
-    const obsDeck = new THREE.Mesh(new THREE.BoxGeometry(18.6, 6.4, 13.6), warmFloodMat);
-    obsDeck.position.y = 238.8 + 3.2;
-    esb.add(obsDeck);
-
-    // Architectural window mullions & upper cornice on 86th-floor observatory
-    for (let mx = -7.5; mx <= 7.5; mx += 3.0) {
-      const mullionZ = new THREE.Mesh(new THREE.BoxGeometry(0.45, 6.4, 13.95), darkBronzeFrameMat);
-      mullionZ.position.set(mx, 242.0, 0);
-      esb.add(mullionZ);
-    }
-    for (let mz = -5.0; mz <= 5.0; mz += 2.5) {
-      const mullionX = new THREE.Mesh(new THREE.BoxGeometry(18.95, 6.4, 0.45), darkBronzeFrameMat);
-      mullionX.position.set(0, 242.0, mz);
-      esb.add(mullionX);
-    }
-    const obsCap = new THREE.Mesh(new THREE.BoxGeometry(19.8, 0.9, 14.8), limestoneTrimMat);
-    obsCap.position.y = 245.2;
-    esb.add(obsCap);
-
-    const mast = new THREE.Mesh(new THREE.CylinderGeometry(4.6, 6.2, 30, 16), stainlessSteelMat);
-    mast.position.y = 245 + 15;
-    esb.add(mast);
-
-    const ring102 = new THREE.Mesh(new THREE.CylinderGeometry(5.1, 5.1, 3.2, 16), warmFloodMat);
-    ring102.position.y = 271;
-    esb.add(ring102);
-
-    const dome = new THREE.Mesh(new THREE.CylinderGeometry(1.8, 4.6, 8, 16), stainlessSteelMat);
-    dome.position.y = 276.5;
-    esb.add(dome);
-
-    const spire = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 1.4, 44, 12), stainlessSteelMat);
-    spire.position.y = 280.5 + 22;
-    esb.add(spire);
-
-    const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.95, 8, 8), beaconMat);
-    beacon.position.y = 325.2;
-    esb.add(beacon);
-
-    group.add(esb);
-    colliders.push({
-      minX: b.cx - 34,
-      maxX: b.cx + 34,
-      minZ: b.cz - 25,
-      maxZ: b.cz + 25,
-      maxY: 245
-    });
-    fitToSite([esb], site('Empire State Building'), c0, { height: 443 });
-  }
-
-  // =========================================================================
-  // 2. CHRYSLER BUILDING (Col 5, Row 3: Lexington Ave & 42nd St)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const b = getBlockBounds(5, 3);
-    const chrysler = new THREE.Group();
-    chrysler.position.set(b.cx - 8, 0, b.cz + 6);
-
-    const chryslerShaftMat = landmarkMarbleStoneMat;
-    const crownMat = chryslerCrownMat;
-
-    const base = new THREE.Mesh(new THREE.BoxGeometry(50, 24, 44), chryslerShaftMat);
-    base.position.y = 12;
-    base.castShadow = true;
-    base.receiveShadow = true;
-    chrysler.add(base);
-
-    const step1 = new THREE.Mesh(new THREE.BoxGeometry(40, 24, 34), chryslerShaftMat);
-    step1.position.y = 24 + 12;
-    step1.castShadow = true;
-    step1.receiveShadow = true;
-    chrysler.add(step1);
-
-    const step2 = new THREE.Mesh(new THREE.BoxGeometry(31, 22, 28), chryslerShaftMat);
-    step2.position.y = 48 + 11;
-    step2.castShadow = true;
-    step2.receiveShadow = true;
-    chrysler.add(step2);
-
-    const shaft = new THREE.Mesh(new THREE.BoxGeometry(24, 102, 24), chryslerShaftMat);
-    shaft.position.y = 70 + 51;
-    shaft.castShadow = true;
-    shaft.receiveShadow = true;
-    chrysler.add(shaft);
-
-    // 61st floor Silver Eagle Gargoyles at all 4 corners
-    for (const gx of [-12.2, 12.2]) {
-      for (const gz of [-12.2, 12.2]) {
-        const gargoyle = new THREE.Mesh(new THREE.ConeGeometry(0.95, 3.8, 6), stainlessSteelMat);
-        gargoyle.position.set(gx * 1.06, 169, gz * 1.06);
-        gargoyle.rotation.x = gz > 0 ? Math.PI * 0.38 : -Math.PI * 0.38;
-        gargoyle.rotation.z = gx > 0 ? -Math.PI * 0.38 : Math.PI * 0.38;
-        chrysler.add(gargoyle);
-      }
-    }
-
-    // 7-Tier Terraced Art Deco Sunburst Crown with radiating triangular clerestory windows
-    const numTiers = 7;
-    let curY = 172;
-    for (let t = 0; t < numTiers; t++) {
-      const u = t / numTiers;
-      const w = 22.8 * (1.0 - u * 0.72);
-      const h = 6.8 * (1.0 - u * 0.16);
-
-      const tierCore = new THREE.Mesh(new THREE.BoxGeometry(w, h, w * 0.82), crownMat);
-      tierCore.position.y = curY + h * 0.5;
-      chrysler.add(tierCore);
-
-      const tierCross = new THREE.Mesh(new THREE.BoxGeometry(w * 0.82, h, w), crownMat);
-      tierCross.position.y = curY + h * 0.5;
-      chrysler.add(tierCross);
-
-      const rib = new THREE.Mesh(new THREE.BoxGeometry(w + 0.7, 0.55, w + 0.7), stainlessSteelMat);
-      rib.position.y = curY + h;
-      chrysler.add(rib);
-
-      curY += h;
-    }
-
-    const needle = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 1.35, 38, 12), stainlessSteelMat);
-    needle.position.y = curY + 18;
-    chrysler.add(needle);
-
-    const cBeacon = new THREE.Mesh(new THREE.SphereGeometry(0.8, 8, 8), beaconMat);
-    cBeacon.position.y = curY + 37.5;
-    chrysler.add(cBeacon);
-
-    group.add(chrysler);
-    colliders.push({
-      minX: b.cx - 33,
-      maxX: b.cx + 17,
-      minZ: b.cz - 16,
-      maxZ: b.cz + 28,
-      maxY: 225
-    });
-    fitToSite([chrysler], site('Chrysler Building'), c0, { height: 319 });
-  }
-
-  // =========================================================================
-  // 3. ONE VANDERBILT (Col 3, Row 3: Vanderbilt Ave & 42nd St)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const b = getBlockBounds(3, 3);
-    const vanderbilt = new THREE.Group();
-    vanderbilt.position.set(b.cx + 12, 0, b.cz + 5);
-
-    const ovMat = landmarkSilverCurtainMat;
-
-    const segments = [
-      { w: 40, d: 38, h: 68, y: 0, ox: 0, oz: 0 },
-      { w: 35, d: 33, h: 72, y: 66, ox: 1.0, oz: -1.0 },
-      { w: 29, d: 28, h: 62, y: 136, ox: -1.0, oz: 1.0 },
-      { w: 23, d: 22, h: 42, y: 196, ox: 0.5, oz: 0.5 },
-      { w: 15, d: 15, h: 24, y: 236, ox: 0, oz: 0 }
-    ];
-    for (const seg of segments) {
-      const m = new THREE.Mesh(new THREE.BoxGeometry(seg.w, seg.h, seg.d), ovMat);
-      m.position.set(seg.ox, seg.y + seg.h * 0.5, seg.oz);
-      m.castShadow = true;
-      m.receiveShadow = true;
-      vanderbilt.add(m);
-    }
-
-    // SUMMIT One Vanderbilt cantilevered glass sky-boxes & structural terracotta/steel fins
-    const summitCore = new THREE.Mesh(new THREE.BoxGeometry(24.6, 8.2, 23.2), warmFloodMat);
-    summitCore.position.set(0.5, 206, 0.5);
-    vanderbilt.add(summitCore);
-
-    for (let fx = -11; fx <= 11; fx += 2.75) {
-      const finZ = new THREE.Mesh(new THREE.BoxGeometry(0.42, 8.6, 23.8), stainlessSteelMat);
-      finZ.position.set(0.5 + fx, 206, 0.5);
-      vanderbilt.add(finZ);
-    }
-    for (let fz = -10; fz <= 10; fz += 2.5) {
-      const finX = new THREE.Mesh(new THREE.BoxGeometry(25.2, 8.6, 0.42), stainlessSteelMat);
-      finX.position.set(0.5, 206, 0.5 + fz);
-      vanderbilt.add(finX);
-    }
-
-    const ovSpire = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.95, 30, 8), warmFloodMat);
-    ovSpire.position.y = 260 + 15;
-    vanderbilt.add(ovSpire);
-
-    group.add(vanderbilt);
-    colliders.push({
-      minX: b.cx - 10,
-      maxX: b.cx + 33,
-      minZ: b.cz - 15,
-      maxZ: b.cz + 25,
-      maxY: 260
-    });
-
-    fitToSite([vanderbilt], site('One Vanderbilt'), c0, { height: 427 });
-  }
-
-  // =========================================================================
-  // 4. GRAND CENTRAL TERMINAL, PARK AVE VIADUCT & METLIFE BUILDING (Col 4, Row 3)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const b = getBlockBounds(4, 3);
-    const gctGroup = new THREE.Group();
-    gctGroup.position.set(b.cx, 0, b.cz);
-
-    const gctBody = new THREE.Mesh(new THREE.BoxGeometry(62, 24, 28), landmarkMarbleStoneMat);
-    gctBody.position.set(0, 12, 14);
-    gctBody.castShadow = true;
-    gctBody.receiveShadow = true;
-    gctGroup.add(gctBody);
-
-    const gctRoof = new THREE.Mesh(new THREE.BoxGeometry(58, 3.5, 24), copperRoofMat);
-    gctRoof.position.set(0, 25.5, 14);
-    gctGroup.add(gctRoof);
-
-    // 3 Monumental Beaux-Arts Arched Windows on 42nd St with dark bronze muntin bars & paired Corinthian columns
-    for (const wx of [-17, 0, 17]) {
-      const archWin = new THREE.Mesh(new THREE.BoxGeometry(9.2, 14.2, 0.8), warmFloodMat);
-      archWin.position.set(wx, 11.8, 28.05);
-      gctGroup.add(archWin);
-
-      const archTop = new THREE.Mesh(new THREE.CylinderGeometry(4.6, 4.6, 0.8, 16), warmFloodMat);
-      archTop.rotation.x = Math.PI * 0.5;
-      archTop.position.set(wx, 18.9, 28.05);
-      gctGroup.add(archTop);
-
-      // Bronze window mullions inside each monumental arch
-      for (const mx of [-2.3, 0, 2.3]) {
-        const vBar = new THREE.Mesh(new THREE.BoxGeometry(0.32, 16.5, 0.95), darkBronzeFrameMat);
-        vBar.position.set(wx + mx, 13.0, 28.1);
-        gctGroup.add(vBar);
-      }
-      for (const my of [8.5, 13.0, 17.5]) {
-        const hBar = new THREE.Mesh(new THREE.BoxGeometry(9.2, 0.32, 0.95), darkBronzeFrameMat);
-        hBar.position.set(wx, my, 28.1);
-        gctGroup.add(hBar);
-      }
-    }
-
-    // Paired Beaux-Arts Indiana Limestone Corinthian Columns flanking the 3 arches
-    for (const cx of [-25.5, -23.0, -9.8, -7.2, 7.2, 9.8, 23.0, 25.5]) {
-      const col = new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.70, 18.2, 12), limestoneTrimMat);
-      col.position.set(cx, 12.2, 28.45);
-      col.castShadow = true;
-      gctGroup.add(col);
-    }
-
-    // Classical cornice entablature & stepped Mercury/Hercules/Minerva clock pediment
-    const gctEntablature = new THREE.Mesh(new THREE.BoxGeometry(58, 1.8, 2.2), limestoneTrimMat);
-    gctEntablature.position.set(0, 22.4, 28.2);
-    gctGroup.add(gctEntablature);
-
-    const pediment = new THREE.Mesh(new THREE.BoxGeometry(16, 4.8, 2.2), limestoneTrimMat);
-    pediment.position.set(0, 25.4, 27.6);
-    gctGroup.add(pediment);
-
-    const pedimentPeak = new THREE.Mesh(new THREE.BoxGeometry(9.5, 2.4, 2.2), limestoneTrimMat);
-    pedimentPeak.position.set(0, 28.6, 27.6);
-    gctGroup.add(pedimentPeak);
-
-    const clockBezel = new THREE.Mesh(new THREE.CylinderGeometry(2.55, 2.55, 0.75, 20), darkBronzeFrameMat);
-    clockBezel.rotation.x = Math.PI * 0.5;
-    clockBezel.position.set(0, 25.8, 28.55);
-    gctGroup.add(clockBezel);
-
-    const clockGlow = new THREE.Mesh(new THREE.CylinderGeometry(2.05, 2.05, 0.85, 20), warmFloodMat);
-    clockGlow.rotation.x = Math.PI * 0.5;
-    clockGlow.position.set(0, 25.8, 28.6);
-    gctGroup.add(clockGlow);
-
-    const viaductDeck = new THREE.Mesh(new THREE.BoxGeometry(11, 1.8, 76), limestoneTrimMat);
-    viaductDeck.position.set(-55, 9.5, 38);
-    viaductDeck.castShadow = true;
-    viaductDeck.receiveShadow = true;
-    gctGroup.add(viaductDeck);
-
-    for (const vz of [8, 28, 52, 70]) {
-      const pier = new THREE.Mesh(new THREE.BoxGeometry(9.5, 9.0, 3.5), limestoneTrimMat);
-      pier.position.set(-55, 4.5, vz);
-      pier.castShadow = true;
-      pier.receiveShadow = true;
-      gctGroup.add(pier);
-    }
-
-    const metlifeMat = landmarkBronzeCurtainMat;
-
-    const mlCenter = new THREE.Mesh(new THREE.BoxGeometry(44, 198, 24), metlifeMat);
-    mlCenter.position.set(0, 99, -12);
-    mlCenter.castShadow = true;
-    mlCenter.receiveShadow = true;
-    gctGroup.add(mlCenter);
-
-    const mlWingW = new THREE.Mesh(new THREE.BoxGeometry(16, 198, 16), metlifeMat);
-    mlWingW.position.set(-24, 99, -12);
-    mlWingW.rotation.y = Math.PI * 0.25;
-    mlWingW.castShadow = true;
-    gctGroup.add(mlWingW);
-
-    const mlWingE = new THREE.Mesh(new THREE.BoxGeometry(16, 198, 16), metlifeMat);
-    mlWingE.position.set(24, 99, -12);
-    mlWingE.rotation.y = Math.PI * 0.25;
-    mlWingE.castShadow = true;
-    gctGroup.add(mlWingE);
-
-    const signBand = new THREE.Mesh(new THREE.BoxGeometry(28.5, 6.8, 25.4), metlifeSignMat);
-    signBand.position.set(0, 191, -12);
-    gctGroup.add(signBand);
-
-    group.add(gctGroup);
-    colliders.push({
-      minX: b.cx - 34,
-      maxX: b.cx + 34,
-      minZ: b.cz - 28,
-      maxZ: b.cz + 28,
-      maxY: 198
-    });
-    fitToSite([gctGroup], unionSite('Grand Central Terminal', 'MetLife Building'), c0, { height: 246 });
-  }
-
-  // =========================================================================
-  // 5. BRYANT PARK & NEW YORK PUBLIC LIBRARY (Col 2, Row 4: 5th Ave & 42nd St)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const b = getBlockBounds(2, 4);
-    const bpGroup = new THREE.Group();
-    bpGroup.position.set(b.cx, 0, b.cz);
-
-    const nypl = new THREE.Mesh(new THREE.BoxGeometry(26, 21, 56), landmarkMarbleStoneMat);
-    nypl.position.set(20, 10.5, 0);
-    nypl.castShadow = true;
-    nypl.receiveShadow = true;
-    bpGroup.add(nypl);
-
-    const nyplRoof = new THREE.Mesh(new THREE.BoxGeometry(22, 3.2, 50), copperRoofMat);
-    nyplRoof.position.set(20, 22.5, 0);
-    bpGroup.add(nyplRoof);
-
-    // Beaux-Arts 5th Avenue Colonnaded Portico: recessed marble vestibule, 3 arched bronze/glass portals & 6 Corinthian columns
-    const porticoBack = new THREE.Mesh(new THREE.BoxGeometry(2.6, 18.5, 22), landmarkMarbleStoneMat);
-    porticoBack.position.set(32.2, 9.25, 0);
-    porticoBack.castShadow = true;
-    porticoBack.receiveShadow = true;
-    bpGroup.add(porticoBack);
-
-    for (const pz of [-6.4, 0, 6.4]) {
-      const archFrame = new THREE.Mesh(new THREE.BoxGeometry(1.1, 11.8, 4.2), darkBronzeFrameMat);
-      archFrame.position.set(33.3, 8.2, pz);
-      bpGroup.add(archFrame);
-
-      const archGlass = new THREE.Mesh(new THREE.BoxGeometry(1.25, 10.6, 3.2), warmFloodMat);
-      archGlass.position.set(33.35, 8.0, pz);
-      bpGroup.add(archGlass);
-    }
-
-    for (const cz of [-9.6, -5.8, -2.2, 2.2, 5.8, 9.6]) {
-      const column = new THREE.Mesh(new THREE.CylinderGeometry(0.58, 0.66, 14.2, 12), limestoneTrimMat);
-      column.position.set(34.8, 9.5, cz);
-      column.castShadow = true;
-      column.receiveShadow = true;
-      bpGroup.add(column);
-    }
-
-    const porticoEntablature = new THREE.Mesh(new THREE.BoxGeometry(4.2, 2.2, 22.4), limestoneTrimMat);
-    porticoEntablature.position.set(33.6, 17.6, 0);
-    porticoEntablature.castShadow = true;
-    bpGroup.add(porticoEntablature);
-
-    const porticoAttic = new THREE.Mesh(new THREE.BoxGeometry(3.6, 2.0, 16.0), limestoneTrimMat);
-    porticoAttic.position.set(33.4, 19.6, 0);
-    bpGroup.add(porticoAttic);
-
-    const stairs = new THREE.Mesh(new THREE.BoxGeometry(5.5, 2.4, 18), limestoneTrimMat);
-    stairs.position.set(35.5, 1.2, 0);
-    stairs.receiveShadow = true;
-    bpGroup.add(stairs);
-
-    for (const lz of [-10.5, 10.5]) {
-      const pedestal = new THREE.Mesh(new THREE.BoxGeometry(3.2, 2.2, 2.2), limestoneTrimMat);
-      pedestal.position.set(35.8, 1.1, lz);
-      bpGroup.add(pedestal);
-      const lion = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.4, 1.2), limestoneTrimMat);
-      lion.position.set(36.0, 2.8, lz);
-      bpGroup.add(lion);
-    }
-
-    const lawnWall = new THREE.Mesh(new THREE.BoxGeometry(46, 0.85, 60), limestoneTrimMat);
-    lawnWall.position.set(-14, 0.42, 0);
-    lawnWall.receiveShadow = true;
-    bpGroup.add(lawnWall);
-
-    const lawnGrassMat = new THREE.MeshStandardNodeMaterial({
-      color: 0x388c42,
-      emissive: 0x081e0b,
-      roughness: 0.80
-    });
-    const lawn = new THREE.Mesh(new THREE.BoxGeometry(38, 0.28, 48), lawnGrassMat);
-    lawn.position.set(-13, 0.92, 0);
-    lawn.receiveShadow = true;
-    bpGroup.add(lawn);
-
-    const fountainBasin = new THREE.Mesh(new THREE.CylinderGeometry(5.8, 6.2, 1.1, 20), limestoneTrimMat);
-    fountainBasin.position.set(-29, 0.9, 0);
-    bpGroup.add(fountainBasin);
-
-    const fountainWater = new THREE.Mesh(
-      new THREE.CylinderGeometry(5.2, 5.2, 0.16, 20),
-      new THREE.MeshStandardNodeMaterial({ color: 0x24789c, emissive: 0x0a2e40, roughness: 0.12, metalness: 0.65 })
-    );
-    fountainWater.position.set(-29, 1.42, 0);
-    bpGroup.add(fountainWater);
-
-    const carouselBase = new THREE.Mesh(new THREE.CylinderGeometry(3.8, 4.0, 2.8, 14), limestoneTrimMat);
-    carouselBase.position.set(-12, 2.2, 21);
-    bpGroup.add(carouselBase);
-    const carouselRoof = new THREE.Mesh(
-      new THREE.ConeGeometry(4.4, 2.2, 14),
-      new THREE.MeshStandardNodeMaterial({ color: 0xb83228, roughness: 0.45 })
-    );
-    carouselRoof.position.set(-12, 4.6, 21);
-    bpGroup.add(carouselRoof);
-
-    group.add(bpGroup);
-    colliders.push({
-      minX: b.cx + 6,
-      maxX: b.cx + 35,
-      minZ: b.cz - 28,
-      maxZ: b.cz + 28,
-      maxY: 24
-    });
-    fitToSite([bpGroup], blockSite('Bryant Park'), c0, { height: 30, stretch: true });
-    bpGroup.updateMatrixWorld(true);
-    const lb = new THREE.Box3().setFromObject(lawn);
-    bryantParkLawn = { minX: lb.min.x, maxX: lb.max.x, minZ: lb.min.z, maxZ: lb.max.z, top: lb.max.y };
-  }
-
-  // =========================================================================
-  // 6. ONE TIMES SQUARE & BROADWAY LED CANYON (Col 1, Row 3 & Broadway Corridor)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const b = getBlockBounds(1, 3);
-    const tsGroup = new THREE.Group();
-    tsGroup.position.set(b.cx, 0, b.cz);
-
-    const darkFacadeMat = landmarkBronzeCurtainMat;
-
-    const otsW = 18;
-    const otsD = 26;
-    const otsH = 118;
-    const otsX = -16; // b.cx - 16 = -181 (sits right on the Times Square bowtie prow east of Broadway x=-201)
-    const otsTower = new THREE.Mesh(new THREE.BoxGeometry(otsW, otsH, otsD), darkFacadeMat);
-    otsTower.position.set(otsX, otsH * 0.5, 14);
-    otsTower.castShadow = true;
-    otsTower.receiveShadow = true;
-    tsGroup.add(otsTower);
-
-    for (let s = 0; s < 5; s++) {
-      const panelH = 17.5;
-      const panelY = 14 + s * 19.5;
-      const screenW = new THREE.Mesh(new THREE.PlaneGeometry(otsD - 2, panelH), createBillboardMaterial(s));
-      screenW.rotation.y = -Math.PI * 0.5;
-      screenW.position.set(otsX - otsW * 0.5 - 0.25, panelY, 14);
-      tsGroup.add(screenW);
-
-      const screenS = new THREE.Mesh(new THREE.PlaneGeometry(otsW - 2, panelH), createBillboardMaterial(s + 1));
-      screenS.position.set(otsX, panelY, 14 + otsD * 0.5 + 0.25);
-      tsGroup.add(screenS);
-
-      const screenN = new THREE.Mesh(new THREE.PlaneGeometry(otsW - 2, panelH), createBillboardMaterial(s + 3));
-      screenN.rotation.y = Math.PI;
-      screenN.position.set(otsX, panelY, 14 - otsD * 0.5 - 0.25);
-      tsGroup.add(screenN);
-    }
-
-    const ballMast = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.5, 26, 8), stainlessSteelMat);
-    ballMast.position.set(otsX, otsH + 13, 14);
-    tsGroup.add(ballMast);
-
-    const nyeBall = new THREE.Mesh(
-      new THREE.SphereGeometry(2.8, 14, 14),
-      new THREE.MeshBasicNodeMaterial({ color: 0x88f5ff })
-    );
-    nyeBall.position.set(otsX, otsH + 22, 14);
-    tsGroup.add(nyeBall);
-
-    // (the towers around the bowtie are the procedural blocks' Broadway flush walls & billboards now)
-    group.add(tsGroup);
-    colliders.push({ minX: b.cx + otsX - 9, maxX: b.cx + otsX + 9, minZ: b.cz + 1, maxZ: b.cz + 27, maxY: otsH });
-    fitToSite([tsGroup], site('One Times Square'), c0, { height: 120 });
-  }
-
-  // =========================================================================
-  // 7. ROCKEFELLER CENTER / 30 ROCK (Col 2, Row 2: 5th-6th Ave, 45th-48th St)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const b = getBlockBounds(2, 2);
-    const rockGroup = new THREE.Group();
-    rockGroup.position.set(b.cx, 0, b.cz);
-
-    const rockMat = landmarkLimestoneCrownMat;
-
-    const slabMain = new THREE.Mesh(new THREE.BoxGeometry(24, 212, 56), rockMat);
-    slabMain.position.set(-14, 106, 0);
-    slabMain.castShadow = true;
-    slabMain.receiveShadow = true;
-    rockGroup.add(slabMain);
-
-    const slabStep1 = new THREE.Mesh(new THREE.BoxGeometry(34, 135, 44), rockMat);
-    slabStep1.position.set(-14, 67.5, 0);
-    slabStep1.castShadow = true;
-    slabStep1.receiveShadow = true;
-    rockGroup.add(slabStep1);
-
-    for (const cz of [-18, 18]) {
-      const wing = new THREE.Mesh(new THREE.BoxGeometry(28, 28, 18), rockMat);
-      wing.position.set(18, 14, cz);
-      wing.castShadow = true;
-      wing.receiveShadow = true;
-      rockGroup.add(wing);
-    }
-
-    const prometheus = new THREE.Mesh(
-      new THREE.TorusGeometry(2.6, 0.45, 10, 20),
-      new THREE.MeshStandardNodeMaterial({ color: 0xffc845, metalness: 0.65, roughness: 0.22 })
-    );
-    prometheus.position.set(1, 3.8, 0);
-    prometheus.rotation.y = Math.PI * 0.5;
-    rockGroup.add(prometheus);
-
-    group.add(rockGroup);
-    colliders.push({
-      minX: b.cx - 32,
-      maxX: b.cx + 4,
-      minZ: b.cz - 28,
-      maxZ: b.cz + 28,
-      maxY: 212
-    });
-    fitToSite([rockGroup], site('30 Rockefeller Plaza'), c0, { height: 259 });
-  }
-
-  // =========================================================================
-  // 8. CITIGROUP CENTER (Col 5, Row 1: Lexington Ave & 53rd St)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const b = getBlockBounds(5, 1);
-    const citiGroup = new THREE.Group();
-    citiGroup.position.set(b.cx, 0, b.cz);
-
-    const citiMat = landmarkSilverCurtainMat;
-
-    for (const [sx, sz] of [[-18, 0], [18, 0], [0, -18], [0, 18]]) {
-      const stilt = new THREE.Mesh(new THREE.BoxGeometry(7.5, 30, 7.5), stainlessSteelMat);
-      stilt.position.set(sx, 15, sz);
-      stilt.castShadow = true;
-      stilt.receiveShadow = true;
-      citiGroup.add(stilt);
-    }
-    const core = new THREE.Mesh(new THREE.BoxGeometry(16, 30, 16), stainlessSteelMat);
-    core.position.set(0, 15, 0);
-    core.castShadow = true;
-    core.receiveShadow = true;
-    citiGroup.add(core);
-
-    const citiShaft = new THREE.Mesh(new THREE.BoxGeometry(42, 145, 42), citiMat);
-    citiShaft.position.set(0, 30 + 72.5, 0);
-    citiShaft.castShadow = true;
-    citiShaft.receiveShadow = true;
-    citiGroup.add(citiShaft);
-
-    const wedgeShape = new THREE.Shape();
-    wedgeShape.moveTo(-21, 0);
-    wedgeShape.lineTo(21, 0);
-    wedgeShape.lineTo(-21, 34);
-    wedgeShape.closePath();
-
-    const wedgeGeo = new THREE.ExtrudeGeometry(wedgeShape, { depth: 42, bevelEnabled: false });
-    wedgeGeo.translate(0, 0, -21);
-    const citiCrown = new THREE.Mesh(wedgeGeo, stainlessSteelMat);
-    citiCrown.position.set(0, 175, 0);
-    citiGroup.add(citiCrown);
-
-    group.add(citiGroup);
-    colliders.push({
-      minX: b.cx - 21,
-      maxX: b.cx + 21,
-      minZ: b.cz - 21,
-      maxZ: b.cz + 21,
-      maxY: 209
-    });
-    fitToSite([citiGroup], site('Citigroup Center'), c0, { height: 279 });
-  }
-
-  // =========================================================================
-  // 9. FLATIRON BUILDING (Col 2, Row 7: 5th Ave / Broadway & 23rd St)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const b = getBlockBounds(2, 7);
-    const flatironGroup = new THREE.Group();
-    // Sits on the triangular island between Broadway (x = -42) and 5th Ave (x = 0)
-    flatironGroup.position.set(b.cx + 28, 0, b.cz - 4);
-
-    const flatironMat = landmarkMarbleStoneMat;
-
-    const triShape = new THREE.Shape();
-    triShape.moveTo(0, -26);
-    triShape.quadraticCurveTo(2.0, -26, 11, 24);
-    triShape.lineTo(-13, 24);
-    triShape.quadraticCurveTo(-2.5, -26, 0, -26);
-
-    const flatGeo = new THREE.ExtrudeGeometry(triShape, {
-      depth: 88,
-      bevelEnabled: true,
-      bevelThickness: 0.6,
-      bevelSize: 0.6,
-      bevelSegments: 2
-    });
-    flatGeo.rotateX(Math.PI * 0.5);
-    flatGeo.translate(0, 88, 0);
-
-    const flatironMesh = new THREE.Mesh(flatGeo, flatironMat);
-    flatironMesh.castShadow = true;
-    flatironMesh.receiveShadow = true;
-    flatironGroup.add(flatironMesh);
-
-    const corniceGeo = new THREE.ExtrudeGeometry(triShape, {
-      depth: 2.8,
-      bevelEnabled: true,
-      bevelThickness: 0.8,
-      bevelSize: 1.2,
-      bevelSegments: 2
-    });
-    corniceGeo.rotateX(Math.PI * 0.5);
-    corniceGeo.translate(0, 89.2, 0);
-    const corniceMesh = new THREE.Mesh(corniceGeo, limestoneTrimMat);
-    flatironGroup.add(corniceMesh);
-
-    group.add(flatironGroup);
-    colliders.push({ minX: b.cx + 15, maxX: b.cx + 39, minZ: b.cz - 30, maxZ: b.cz + 20, maxY: 90 });
-    fitToSite([flatironGroup], site('Flatiron Building'), c0, { height: 87 });
-  }
-
-  // =========================================================================
-  // 10. SEAGRAM BUILDING & GRANITE PLAZA (Col 4, Row 1: Park Ave & 53rd St)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const b = getBlockBounds(4, 1);
-    const seagramGroup = new THREE.Group();
-    seagramGroup.position.set(b.cx, 0, b.cz);
-
-    const seagramMat = landmarkBronzeCurtainMat;
-
-    const tower = new THREE.Mesh(new THREE.BoxGeometry(42, 162, 36), seagramMat);
-    tower.position.set(8, 81, 0);
-    tower.castShadow = true;
-    tower.receiveShadow = true;
-    seagramGroup.add(tower);
-
-    const bustle = new THREE.Mesh(new THREE.BoxGeometry(24, 92, 26), seagramMat);
-    bustle.position.set(22, 46, 0);
-    bustle.castShadow = true;
-    bustle.receiveShadow = true;
-    seagramGroup.add(bustle);
-
-    const poolMat = new THREE.MeshStandardNodeMaterial({ color: 0x1e5266, roughness: 0.1, metalness: 0.7 });
-    for (const pz of [-14, 14]) {
-      const pool = new THREE.Mesh(new THREE.BoxGeometry(14, 0.55, 12), poolMat);
-      pool.position.set(-22, 0.32, pz);
-      seagramGroup.add(pool);
-    }
-
-    group.add(seagramGroup);
-    colliders.push({
-      minX: b.cx - 13,
-      maxX: b.cx + 34,
-      minZ: b.cz - 18,
-      maxZ: b.cz + 18,
-      maxY: 162
-    });
-    fitToSite([seagramGroup], site('Seagram Building'), c0, { height: 157, offset: [-14, 0] });
-  }
-
-  // =========================================================================
-  // 11. ONE WORLD TRADE CENTER (LOWER MANHATTAN · VESEY ST & FULTON ST)
-  // =========================================================================
-  {
-    const c0 = colliders.length;
-    const owtcGroup = new THREE.Group();
-    owtcGroup.position.set(-260, 0, 1234);
-
-    const owtcMat = landmarkSilverCurtainMat;
-    const podiumFinMat = new THREE.MeshStandardNodeMaterial({
-      color: 0xc8d4e0,
-      roughness: 0.22,
-      metalness: 0.85
-    });
-
-    // 52m-tall Glass & Steel Podium Base with Vertical Prismatic Louver Fins
-    const basePodium = new THREE.Mesh(new THREE.BoxGeometry(48, 52, 48), owtcMat);
-    basePodium.position.y = 26;
-    basePodium.castShadow = true;
-    basePodium.receiveShadow = true;
-    owtcGroup.add(basePodium);
-
-    for (let f = -20; f <= 20; f += 5) {
-      const finNS = new THREE.Mesh(new THREE.BoxGeometry(0.45, 44, 49.2), podiumFinMat);
-      finNS.position.set(f, 28, 0);
-      owtcGroup.add(finNS);
-
-      const finEW = new THREE.Mesh(new THREE.BoxGeometry(49.2, 44, 0.45), podiumFinMat);
-      finEW.position.set(0, 28, f);
-      owtcGroup.add(finEW);
-    }
-
-    // Illuminated Vesey St / Fulton St Double-Height Glass Lobby Portals
-    const lobbyNS = new THREE.Mesh(new THREE.BoxGeometry(24, 9.5, 48.6), warmFloodMat);
-    lobbyNS.position.set(0, 4.8, 0);
-    owtcGroup.add(lobbyNS);
-    const lobbyEW = new THREE.Mesh(new THREE.BoxGeometry(48.6, 9.5, 24), warmFloodMat);
-    lobbyEW.position.set(0, 4.8, 0);
-    owtcGroup.add(lobbyEW);
-
-    //Podium Setback Collar at y = 52m
-    const podiumCollar = new THREE.Mesh(new THREE.BoxGeometry(49.6, 1.8, 49.6), podiumFinMat);
-    podiumCollar.position.y = 52.0;
-    owtcGroup.add(podiumCollar);
-
-    // True Flat-Faceted Chamfered Square Antiprism Shaft (8 razor-sharp triangular glass planes)
-    const shaft1Geo = new THREE.CylinderGeometry(23.5, 33.9, 235, 4).toNonIndexed();
-    shaft1Geo.computeVertexNormals();
-    const shaft1 = new THREE.Mesh(shaft1Geo, owtcMat);
-    shaft1.rotation.y = Math.PI * 0.25;
-    shaft1.position.y = 52 + 117.5;
-    shaft1.castShadow = true;
-    shaft1.receiveShadow = true;
-    owtcGroup.add(shaft1);
-
-    const shaft2Geo = new THREE.CylinderGeometry(33.9, 23.5, 235, 4).toNonIndexed();
-    shaft2Geo.computeVertexNormals();
-    const shaft2 = new THREE.Mesh(shaft2Geo, owtcMat);
-    shaft2.position.y = 52 + 117.5;
-    shaft2.castShadow = true;
-    shaft2.receiveShadow = true;
-    owtcGroup.add(shaft2);
-
-    const parapetRing = new THREE.Mesh(new THREE.CylinderGeometry(19, 19, 8, 16), warmFloodMat);
-    parapetRing.position.y = 291;
-    owtcGroup.add(parapetRing);
-
-    const spire = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 2.2, 68, 12), podiumFinMat);
-    spire.position.y = 295 + 34;
-    owtcGroup.add(spire);
-
-    const beacon = new THREE.Mesh(new THREE.SphereGeometry(1.4, 10, 10), warmFloodMat);
-    beacon.position.y = 364;
-    owtcGroup.add(beacon);
-
-    group.add(owtcGroup);
-    colliders.push({
-      minX: -285,
-      maxX: -235,
-      minZ: 1209,
-      maxZ: 1259,
-      maxY: 364
-    });
-    fitToSite([owtcGroup], site('One World Trade Center'), c0, { height: 541, horizontal: 1.27 }); // a 61 m square base
-  }
-
-  // Box-shaped facade parts (unrotated) become box-local facade boxes: every wall laid out in whole window bays between
-  // solid masonry corners, like the procedural blocks, so no window is cut by a corner. Rotated & non-box parts (MetLife
-  // wings, Flatiron prism, One WTC antiprism) keep the world-space window grid.
-  group.updateMatrixWorld(true);
-  const facadeBoxes = new Map();
-  const boxParts = [];
-  group.traverse((obj) => {
-    if (obj.isMesh && boxLocalTwins.has(obj.material) && obj.geometry.type === 'BoxGeometry') boxParts.push(obj);
-  });
-  const partPos = new THREE.Vector3();
-  const partRot = new THREE.Quaternion();
-  const partScale = new THREE.Vector3();
-  for (const m of boxParts) {
-    m.matrixWorld.decompose(partPos, partRot, partScale);
-    if (Math.abs(partRot.w) < 0.99999) continue;
-    const { width, height, depth } = m.geometry.parameters;
-    const twin = boxLocalTwins.get(m.material);
-    if (!facadeBoxes.has(twin)) facadeBoxes.set(twin, []);
-    facadeBoxes.get(twin).push({ x: partPos.x, y: partPos.y, z: partPos.z, w: width * partScale.x, h: height * partScale.y, d: depth * partScale.z });
-    m.removeFromParent();
-  }
-  for (const [mat, boxes] of facadeBoxes) {
-    const inst = createFacadeBoxes(mat, boxes);
-    inst.castShadow = true;
-    inst.receiveShadow = true;
-    group.add(inst);
-  }
-
-  batchStaticGroupMeshes(group, new Set([stainlessSteelMat]));
-
-  scene.add(group);
-  return { group, colliders };
+  return f;
+}
+/** Placement on an edge: `s` metres from its start, `off` metres outward, local +z pointing out of the wall */
+function edgeMatrix(e, s, y, off = 0) {
+  return new THREE.Matrix4()
+    .makeTranslation(e.a.x + e.dx * s + e.nx * off, y, e.a.z + e.dz * s + e.nz * off)
+    .multiply(new THREE.Matrix4().makeRotationY(Math.atan2(e.nx, e.nz)));
+}
+/** The outline vertex that is the most in a direction (dx, dz): e.g. (−1, −1) the north-west corner */
+function extremeVertex(ring, dx, dz) {
+  let best = ring[0], bv = -Infinity;
+  for (const p of ring) { const v = p.x * dx + p.z * dz; if (v > bv) { bv = v; best = p; } }
+  return best;
+}
+/** A point `inset` metres inside the outline from one of its vertices (towards the centroid) */
+function insetPoint(ring, p, inset) {
+  const c = centroidOf(ring);
+  const L = Math.hypot(c.x - p.x, c.z - p.z) || 1;
+  return { x: p.x + ((c.x - p.x) / L) * inset, z: p.z + ((c.z - p.z) / L) * inset };
 }
 
-export { buildLandmarks, bryantParkLawn };
+// ---------------------------------------------------------------------------------------------------------------------
+// Geometry sink: everything is baked in world space into one geometry per material
+// ---------------------------------------------------------------------------------------------------------------------
+class Sink {
+  constructor() { this.buckets = new Map(); this.colliders = []; }
+  add(geo, mat, matrix = null) {
+    let g = geo.index ? geo.toNonIndexed() : geo;
+    if (matrix) g.applyMatrix4(matrix);
+    for (const k of Object.keys(g.attributes)) if (k !== 'position' && k !== 'normal' && k !== 'uv') g.deleteAttribute(k);
+    if (!g.attributes.normal) g.computeVertexNormals();
+    if (!g.attributes.uv) g.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(g.attributes.position.count * 2), 2));
+    if (!this.buckets.has(mat)) this.buckets.set(mat, []);
+    this.buckets.get(mat).push(g);
+  }
+  box(w, h, d, mat, matrix) { this.add(new THREE.BoxGeometry(w, h, d), mat, matrix); }
+  collide(minX, maxX, minZ, maxZ, maxY) { this.colliders.push({ minX, maxX, minZ, maxZ, maxY }); }
+  /** Axis-aligned boxes tiling an outline (minus an optional hole) for the collision system */
+  collideRing(ring, maxY, cell = 4, hole = null) {
+    const b = bboxOf(ring);
+    const w = b.maxX - b.minX, d = b.maxZ - b.minZ;
+    const fill = signedArea(ring) / (w * d || 1);
+    if (!hole && (w * d < 400 || (fill > 0.85 && Math.max(w, d) < 70))) { this.collide(b.minX, b.maxX, b.minZ, b.maxZ, maxY); return; }
+    const nx = Math.ceil(w / cell), nz = Math.ceil(d / cell);
+    const inside = (ix, iz) => {
+      const x = b.minX + (ix + 0.5) * cell, z = b.minZ + (iz + 0.5) * cell;
+      return inRing(ring, x, z) && !(hole && inRing(hole, x, z));
+    };
+    // rows of runs, then equal runs stacked across rows
+    const open = new Map(); // key "ix0:ix1" -> { iz0 }
+    for (let iz = 0; iz <= nz; iz++) {
+      const runs = [];
+      if (iz < nz) {
+        let start = -1;
+        for (let ix = 0; ix <= nx; ix++) {
+          const on = ix < nx && inside(ix, iz);
+          if (on && start < 0) start = ix;
+          if (!on && start >= 0) { runs.push([start, ix]); start = -1; }
+        }
+      }
+      const keys = new Set(runs.map((r) => `${r[0]}:${r[1]}`));
+      for (const [k, v] of [...open]) {
+        if (!keys.has(k)) {
+          const [ix0, ix1] = k.split(':').map(Number);
+          this.collide(b.minX + ix0 * cell, Math.min(b.maxX, b.minX + ix1 * cell), b.minZ + v.iz0 * cell, Math.min(b.maxZ, b.minZ + iz * cell), maxY);
+          open.delete(k);
+        }
+      }
+      for (const k of keys) if (!open.has(k)) open.set(k, { iz0: iz });
+    }
+  }
+}
+
+/** Hand-built triangles with per-face normals & simple UVs */
+class Poly {
+  constructor() { this.p = []; this.n = []; this.uv = []; }
+  tri(a, b, c, want = null) {
+    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const L = Math.hypot(nx, ny, nz);
+    if (L < 1e-9) return;
+    nx /= L; ny /= L; nz /= L;
+    if (want && nx * want[0] + ny * want[1] + nz * want[2] < 0) { [b, c] = [c, b]; nx = -nx; ny = -ny; nz = -nz; }
+    for (const q of [a, b, c]) {
+      this.p.push(q[0], q[1], q[2]);
+      this.n.push(nx, ny, nz);
+      // metres along the dominant horizontal axis & height: good enough for the plain materials
+      this.uv.push(Math.abs(nx) > Math.abs(nz) ? q[2] : q[0], Math.abs(ny) > 0.7 ? q[2] : q[1]);
+    }
+  }
+  quad(a, b, c, d, want = null) { this.tri(a, b, c, want); this.tri(a, c, d, want); }
+  geometry() {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(this.p, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.n, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
+    return g;
+  }
+}
+
+/** The vertical walls of an outline between two heights (edges listed in `skip` are left open) */
+function wallRing(ring, y0, y1, skip = null) {
+  const P = new Poly();
+  for (const e of edgesOf(ring)) {
+    if (skip && skip.has(e.i)) continue;
+    P.quad([e.a.x, y0, e.a.z], [e.a.x, y1, e.a.z], [e.b.x, y1, e.b.z], [e.b.x, y0, e.b.z], [e.nx, 0, e.nz]);
+  }
+  return P.geometry();
+}
+/** A horizontal cap over an outline (with holes) at height y, or lifted by `hf(p)`, facing up (or down) */
+function capRing(ring, y, { holes = [], hf = null, up = true } = {}) {
+  const contour = ring.map((p) => new THREE.Vector2(p.x, p.z));
+  const holeV = holes.map((h) => h.map((p) => new THREE.Vector2(p.x, p.z)));
+  const all = [...ring, ...holes.flat()];
+  const tris = THREE.ShapeUtils.triangulateShape(contour, holeV);
+  const P = new Poly();
+  const Y = (p) => (hf ? hf(p) : y);
+  for (const [i, j, k] of tris) {
+    const a = all[i], b = all[j], c = all[k];
+    P.tri([a.x, Y(a), a.z], [b.x, Y(b), b.z], [c.x, Y(c), c.z], [0, up ? 1 : -1, 0]);
+  }
+  return P.geometry();
+}
+/** A band (cornice, string course, parapet) around an outline: offset `out`, from y0 to y1, with top & underside */
+function bandRing(sink, ring, y0, y1, out, mat) {
+  const r = offsetRing(ring, out) || ring;
+  sink.add(wallRing(r, y0, y1), mat);
+  sink.add(capRing(r, y1), mat);
+  if (out > 0.02 && y0 > 0.1) sink.add(capRing(r, y0, { up: false }), mat);
+}
+/** A strip between two outlines with the same vertex count (stadium terraces) */
+function stripRings(inner, yi, outer, yo) {
+  const P = new Poly();
+  const n = inner.length;
+  for (let i = 0; i < n; i++) {
+    const a = inner[i], b = inner[(i + 1) % n], c = outer[(i + 1) % n], d = outer[i];
+    P.quad([a.x, yi, a.z], [b.x, yi, b.z], [c.x, yo, c.z], [d.x, yo, d.z], [0, 1, 0]);
+  }
+  return P.geometry();
+}
+
+/**
+ * A roof following the real outline: the outline (in the frame's local coordinates) is clipped into regions where the
+ * height field is linear, each region is triangulated at its heights and skirted down to the eave along the walls.
+ *   regions: [{ cuts: [[nx, nz, c], ...], hf(u, v) }]; skirtMat(edge) picks the gable material (null: no skirt)
+ */
+function facetRoof(sink, ring, frame, eaveY, regions, roofMat, skirtMat) {
+  const local = ring.map((p) => frame.toLocal(p));
+  const M = frame.matrix();
+  for (const reg of regions) {
+    let poly = local;
+    for (const [nx, nz, c] of reg.cuts) { poly = clipPoly(poly, nx, nz, c); if (!poly.length) break; }
+    if (!poly.length) continue;
+    const H = (p) => Math.max(eaveY, reg.hf(p.x, p.z));
+    sink.add(capRing(poly, eaveY, { hf: H }), roofMat, M);
+    const P = new Map();
+    for (const e of edgesOf(poly)) {
+      const mat = skirtMat && skirtMat(e, H, local);
+      if (!mat) continue;
+      const ya = H(e.a), yb = H(e.b);
+      if (Math.max(ya, yb) - eaveY < 0.02) continue;
+      if (!P.has(mat)) P.set(mat, new Poly());
+      P.get(mat).quad([e.a.x, eaveY, e.a.z], [e.a.x, ya, e.a.z], [e.b.x, yb, e.b.z], [e.b.x, eaveY, e.b.z], [e.nx, 0, e.nz]);
+    }
+    for (const [mat, poly2] of P) sink.add(poly2.geometry(), mat, M);
+  }
+}
+const onOutline = (e, local) => distToRing(local, e.mx, e.mz) < 0.05;
+/** Pitched roof along the frame's long axis (ridge at v = 0), gable skirts on the walls */
+function ridgeRoof(sink, ring, frame, eaveY, rise, roofMat, wallMat) {
+  const hd = frame.d / 2;
+  const hf = (u, v) => eaveY + rise * (1 - Math.abs(v) / hd);
+  facetRoof(sink, ring, frame, eaveY, [{ cuts: [[0, 1, 0]], hf }, { cuts: [[0, -1, 0]], hf }], roofMat, (e, H, local) => (onOutline(e, local) ? wallMat : null));
+}
+/** Hipped roof: four facets meeting at the centre */
+function hipRoof(sink, ring, frame, eaveY, rise, roofMat, wallMat) {
+  const hw = frame.w / 2, hd = frame.d / 2;
+  const hf = (u, v) => eaveY + rise * (1 - Math.max(Math.abs(u) / hw, Math.abs(v) / hd));
+  const regions = [];
+  for (const s1 of [1, -1]) for (const s2 of [1, -1]) regions.push({ cuts: [[s1 / hw, -s1 / hd, 0], [s2 / hw, s2 / hd, 0]], hf });
+  facetRoof(sink, ring, frame, eaveY, regions, roofMat, (e, H, local) => (onOutline(e, local) ? wallMat : null));
+}
+/** Sawtooth roof: teeth of `period` metres along the long axis, each rising `rise` to a vertical glazed face */
+function sawtoothRoof(sink, ring, frame, baseY, rise, period, roofMat, glassMat, wallMat) {
+  const hw = frame.w / 2;
+  const regions = [];
+  for (let u0 = -hw; u0 < hw - 0.5; u0 += period) {
+    const u1 = Math.min(hw, u0 + period);
+    regions.push({ cuts: [[1, 0, u0], [-1, 0, -u1]], hf: (u) => baseY + rise * Math.min(1, (u - u0) / period), u1 });
+  }
+  for (const reg of regions) {
+    facetRoof(sink, ring, frame, baseY, [reg], roofMat, (e, H, local) => {
+      if (Math.abs(e.mx - reg.u1) < 0.01) return glassMat; // the vertical face of the tooth
+      return onOutline(e, local) ? wallMat : null;
+    });
+  }
+}
+
+/** Arch outlines (local XY, centred, base at y = 0): 'round', 'pointed' (equilateral) or 'parabolic' (from the base) */
+function archShape(w, h, kind, spring = null) {
+  const s = new THREE.Shape();
+  const hw = w / 2;
+  if (kind === 'parabolic') {
+    s.moveTo(-hw, 0);
+    for (let i = 0; i <= 16; i++) { const t = -1 + (2 * i) / 16; s.lineTo(t * hw, h * (1 - t * t)); }
+    s.lineTo(hw, 0);
+  } else if (kind === 'pointed') {
+    // equilateral: two arcs of radius w centred on the opposite springing points
+    const sp = spring ?? Math.max(0, h - 0.866 * w);
+    const k = (h - sp) / (0.866 * w);
+    s.moveTo(-hw, 0); s.lineTo(-hw, sp);
+    for (let i = 1; i <= 8; i++) { const x = -hw + (hw * i) / 8; s.lineTo(x, sp + k * Math.sqrt(Math.max(0, w * w - (x - hw) * (x - hw)))); }
+    for (let i = 1; i <= 8; i++) { const x = (hw * i) / 8; s.lineTo(x, sp + k * Math.sqrt(Math.max(0, w * w - (x + hw) * (x + hw)))); }
+    s.lineTo(hw, 0);
+  } else if (kind === 'flat') {
+    s.moveTo(-hw, 0); s.lineTo(-hw, h); s.lineTo(hw, h); s.lineTo(hw, 0);
+  } else {
+    const sp = spring ?? Math.max(0, h - hw);
+    const r = h - sp;
+    s.moveTo(-hw, 0); s.lineTo(-hw, sp);
+    for (let i = 0; i <= 12; i++) { const a = Math.PI - (Math.PI * i) / 12; s.lineTo(Math.cos(a) * hw, sp + Math.sin(a) * r); }
+    s.lineTo(hw, 0);
+  }
+  s.closePath();
+  return s;
+}
+/** A flat arched opening drawn just proud of a wall (dark glass with a stone surround) */
+function archDecal(sink, e, s, y, w, h, kind, glassMat, trimMat, spring = null) {
+  if (trimMat) sink.add(new THREE.ShapeGeometry(archShape(w + 0.36, h + 0.2, kind, spring === null ? null : spring + 0.1)), trimMat, edgeMatrix(e, s, y - 0.1, 0.03));
+  sink.add(new THREE.ShapeGeometry(archShape(w, h, kind, spring)), glassMat, edgeMatrix(e, s, y, 0.05));
+}
+/** Arched openings spaced along the long edges of an outline */
+function archesAlong(sink, ring, { minLen = 9, spacing = 5, margin = 2.5, y, w, h, kind = 'round', spring = null }, glassMat, trimMat) {
+  for (const e of edgesOf(ring)) {
+    if (e.len < minLen) continue;
+    const n = Math.max(1, Math.floor((e.len - 2 * margin) / spacing));
+    const step = (e.len - 2 * margin) / n;
+    for (let i = 0; i < n; i++) archDecal(sink, e, margin + step * (i + 0.5), y, w, h, kind, glassMat, trimMat, spring);
+  }
+}
+/**
+ * An arcade replacing a wall between two heights: a pierced screen `thick` deep, the gallery's back wall `depth`
+ * behind it and its ceiling. bays: number of arches; archW/archH their size; kind: see archShape
+ */
+function arcadeEdge(sink, e, y0, y1, { bays, archW, archH, kind = 'round', spring = null, thick = 0.5, depth = 2.4, s0 = 0, len = null, off = 0 }, mat, backMat) {
+  const L = len ?? e.len;
+  const H = y1 - y0;
+  const screen = new THREE.Shape();
+  screen.moveTo(-L / 2, 0); screen.lineTo(L / 2, 0); screen.lineTo(L / 2, H); screen.lineTo(-L / 2, H); screen.closePath();
+  const bayW = L / bays;
+  for (let i = 0; i < bays; i++) {
+    const hole = archShape(Math.min(archW, bayW - 0.6), Math.min(archH, H - 0.4), kind, spring);
+    const cx = -L / 2 + bayW * (i + 0.5);
+    const path = new THREE.Path();
+    hole.getPoints(1).forEach((p, k) => (k ? path.lineTo(p.x + cx, p.y) : path.moveTo(p.x + cx, p.y)));
+    path.closePath();
+    screen.holes.push(path);
+  }
+  const geo = new THREE.ExtrudeGeometry(screen, { depth: thick, bevelEnabled: false, curveSegments: 1 });
+  geo.translate(0, 0, -thick);
+  const M = edgeMatrix(e, s0 + L / 2, y0, off);
+  sink.add(geo, mat, M);
+  const P = new Poly();
+  P.quad([-L / 2, 0, -depth], [L / 2, 0, -depth], [L / 2, H, -depth], [-L / 2, H, -depth], [0, 0, 1]); // back wall
+  P.quad([-L / 2, H, -depth], [L / 2, H, -depth], [L / 2, H, -thick], [-L / 2, H, -thick], [0, -1, 0]); // ceiling
+  P.quad([-L / 2, 0, -depth], [-L / 2, 0, -thick], [-L / 2, H, -thick], [-L / 2, H, -depth], [-1, 0, 0]);
+  P.quad([L / 2, 0, -depth], [L / 2, 0, -thick], [L / 2, H, -thick], [L / 2, H, -depth], [1, 0, 0]);
+  sink.add(P.geometry(), backMat, M);
+}
+/** The longest edge of an outline (a building's main front) */
+const longestEdge = (ring) => edgesOf(ring).sort((p, q) => q.len - p.len)[0];
+/** Square tower with a parapet, optional battlements & openings, centred at (x, z), turned by θ */
+function tower(sink, x, z, th, size, y0, y1, mat, { merlons = false, trim = null, openings = null, glass = null } = {}) {
+  const M = new THREE.Matrix4().makeTranslation(x, 0, z).multiply(new THREE.Matrix4().makeRotationY(-th));
+  sink.box(size, y1 - y0, size, mat, M.clone().multiply(new THREE.Matrix4().makeTranslation(0, (y0 + y1) / 2, 0)));
+  if (trim) sink.box(size + 0.5, 0.5, size + 0.5, trim, M.clone().multiply(new THREE.Matrix4().makeTranslation(0, y1 - 0.25, 0)));
+  if (merlons) {
+    const n = Math.max(2, Math.round(size / 1.7));
+    for (let side = 0; side < 4; side++) {
+      const R = new THREE.Matrix4().makeRotationY((side * Math.PI) / 2);
+      for (let i = 0; i < n; i++) {
+        const t = -size / 2 + 0.45 + (i * (size - 0.9)) / Math.max(1, n - 1);
+        sink.box(0.9, 1.3, 0.55, mat, M.clone().multiply(R).multiply(new THREE.Matrix4().makeTranslation(t, y1 + 0.65, size / 2 - 0.27)));
+      }
+    }
+  }
+  if (openings && glass) {
+    for (let side = 0; side < 4; side++) {
+      const R = M.clone().multiply(new THREE.Matrix4().makeRotationY((side * Math.PI) / 2)).multiply(new THREE.Matrix4().makeTranslation(0, openings.y, size / 2 + 0.04));
+      sink.add(new THREE.ShapeGeometry(archShape(openings.w, openings.h, openings.kind || 'round')), glass, R);
+    }
+  }
+  sink.collide(x - size * 0.72, x + size * 0.72, z - size * 0.72, z + size * 0.72, y1);
+  return M;
+}
+/** A tapered brick chimney (round or octagonal) with a plinth and a flared crown */
+function chimney(sink, x, z, h, brick, dark, round = false) {
+  const rb = 1.0 + h * 0.03, rt = rb * 0.5;
+  const seg = round ? 16 : 8;
+  sink.box(rb * 2.6, 2.2, rb * 2.6, dark, new THREE.Matrix4().makeTranslation(x, 1.1, z));
+  sink.box(rb * 2.9, 0.4, rb * 2.9, dark, new THREE.Matrix4().makeTranslation(x, 2.3, z));
+  const shaftH = h - 2.5 - 1.6;
+  sink.add(new THREE.CylinderGeometry(rt, rb, shaftH, seg), brick, new THREE.Matrix4().makeTranslation(x, 2.5 + shaftH / 2, z));
+  sink.add(new THREE.CylinderGeometry(rt * 1.4, rt, 1.6, seg), dark, new THREE.Matrix4().makeTranslation(x, h - 0.8, z));
+  sink.add(new THREE.CylinderGeometry(rt * 1.45, rt * 1.45, 0.3, seg), dark, new THREE.Matrix4().makeTranslation(x, h - 0.15, z));
+  sink.collide(x - rb * 1.4, x + rb * 1.4, z - rb * 1.4, z + rb * 1.4, h);
+}
+/** A ribbed white dome on a low drum (Masia Freixa) */
+function ribbedDome(sink, x, y, z, r, white, green) {
+  sink.add(new THREE.CylinderGeometry(r + 0.25, r + 0.35, 1.1, 24), white, new THREE.Matrix4().makeTranslation(x, y + 0.55, z));
+  sink.add(new THREE.TorusGeometry(r + 0.2, 0.14, 6, 28), green, new THREE.Matrix4().makeTranslation(x, y + 1.1, z).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2)));
+  sink.add(new THREE.SphereGeometry(r, 24, 12, 0, Math.PI * 2, 0, Math.PI / 2), white, new THREE.Matrix4().makeTranslation(x, y + 1.1, z));
+  const ribs = Math.max(6, Math.round(r * 2.2));
+  for (let i = 0; i < ribs; i++) {
+    sink.add(new THREE.TorusGeometry(r + 0.06, 0.09, 4, 14, Math.PI), white, new THREE.Matrix4().makeTranslation(x, y + 1.1, z).multiply(new THREE.Matrix4().makeRotationY((i * Math.PI) / ribs)));
+  }
+  sink.add(new THREE.SphereGeometry(0.32, 10, 8), green, new THREE.Matrix4().makeTranslation(x, y + 1.1 + r + 0.2, z));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The builder
+// ---------------------------------------------------------------------------------------------------------------------
+function buildLandmarks(scene) {
+  const group = new THREE.Group();
+  group.name = GROUP_NAME;
+  const sink = new Sink();
+
+  // Plain materials
+  const std = (color, roughness = 0.85, metalness = 0.0, extra = {}) => new THREE.MeshStandardNodeMaterial({ color, roughness, metalness, ...extra });
+  const stonePale = std(0xd9cfb6);      // the Catedral's pale ashlar
+  const stoneWarm = std(0xc8b48c);      // Romanesque sandstone of the Seu d'Ègara
+  const stoneDark = std(0x8d8068, 0.92); // medieval rubble of the castle & the Torre del Palau
+  const stoneTrim = std(0xe5ddcb, 0.7);  // dressed stone: bases, cornices, surrounds
+  const cream = std(0xe8e0cf, 0.8);      // stucco plinths of the civic buildings
+  const brick = std(0x9c5b3f, 0.9);
+  const brickDark = std(0x76432f, 0.9);
+  const white = std(0xf4f0e7, 0.75);
+  const whiteRoof = std(0xe6e2d8, 0.85);
+  const tile = std(0xa8583a, 0.9);        // terracotta
+  const slate = std(0x5c6068, 0.6, 0.1);  // zinc / slate spires
+  const green = std(0x2e7f5c, 0.35, 0.1); // glazed green tiles
+  const glass = std(0x1a2530, 0.3, 0.5);  // dark openings
+  const glassLight = std(0x7f9fb8, 0.2, 0.4); // skylights
+  const steel = std(0x7c8186, 0.4, 0.7);
+  const steelLight = std(0xd9dad6, 0.5, 0.3);
+  const concrete = std(0xc6c1b5, 0.9);
+  const concreteDark = std(0xa9a49a, 0.9);
+  const pitch = std(0x3b8a3c, 0.95);
+  const wood = std(0x4d3522, 0.7);
+  const bronze = std(0x7d5b2d, 0.45, 0.6);
+  const flagYellow = std(0xf0c020, 0.7);
+  const flagRed = std(0xc8102e, 0.7);
+  const clockFace = new THREE.MeshStandardNodeMaterial({ color: 0xfff6dc, emissive: 0xfff0c0, emissiveIntensity: 0.6, roughness: 0.4 });
+  const dark = std(0x2b2a28, 0.6);
+
+  // Windowed facades (world-space pre-war material: windows laid out along positionWorld). The ground floor of these
+  // materials is a storefront band, so every building hides it behind a plain ground storey `floorH` tall.
+  const facade = (opts) => ({ mat: createPreWarBuildingMaterial(opts), floorH: opts.floorHeight });
+  const civic = facade({ stoneColor: 0xd6cbb2, trimColor: 0xa8967a, windowGlassColor: 0x16222e, windowWidth: 2.6, floorHeight: 4.2, windowRatioX: 0.46, windowRatioY: 0.62, litProbability: 0.3, warmth: 0.85, seed: 3.7 });
+  const stucco = facade({ stoneColor: 0xe4d6ba, trimColor: 0xb0966e, windowGlassColor: 0x16222e, windowWidth: 2.4, floorHeight: 4.0, windowRatioX: 0.44, windowRatioY: 0.64, litProbability: 0.32, warmth: 0.85, seed: 6.6 });
+  const brickFacade = facade({ stoneColor: 0x9e5e42, trimColor: 0x6f4030, windowGlassColor: 0x16222e, windowWidth: 3.2, floorHeight: 3.6, windowRatioX: 0.42, windowRatioY: 0.6, litProbability: 0.22, warmth: 0.8, seed: 8.1 });
+  const hospitalTower = facade({ stoneColor: 0xe4dfd3, trimColor: 0xbbb3a4, windowGlassColor: 0x1b2a38, windowWidth: 2.0, floorHeight: 70 / 17, windowRatioX: 0.62, windowRatioY: 0.5, litProbability: 0.55, warmth: 0.6, seed: 11.3 });
+  const hospitalLow = facade({ stoneColor: 0xe8e3d8, trimColor: 0xc2bbae, windowGlassColor: 0x1b2a38, windowWidth: 2.4, floorHeight: 3.5, windowRatioX: 0.6, windowRatioY: 0.52, litProbability: 0.5, warmth: 0.6, seed: 5.9 });
+
+  const DEFAULT_HEIGHT = { church: 14, townhall: 16, civic: 16, market: 12, theatre: 15, station: 8, hospital: 21, university: 10, industrial: 10, castle: 18, museum: 14, attraction: 14, building: 12, school: 12, historic: 12, tower: 25, chimney: 30 };
+  // OSM's height when it has one (a few tags are the height of a single storey: ignored below 4 m), else the model's
+  const knownHeight = (s) => (s.h && s.h >= 4 ? s.h : null);
+  const heightOf = (s, fallback) => knownHeight(s) || fallback || DEFAULT_HEIGHT[s.kind] || 12;
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // Generic path: the real outline extruded, ground storey + windowed storeys + cornice + flat or tiled roof
+  // -------------------------------------------------------------------------------------------------------------------
+  function generic(s, o = {}) {
+    const ring = cleanRing(s.ring);
+    if (!ring) return null;
+    const f = o.facade || civic;
+    let h = heightOf(s, o.height);
+    const baseH = f.floorH; // exactly one storey of the facade material's grid: its storefront band stays hidden
+    const frame = frameOf(ring);
+    const front = longestEdge(ring);
+    const baseMat = o.baseMat || cream;
+    const roof = o.roof || 'flat';
+    const rise = o.rise || 2.5;
+    const parapet = roof === 'flat' ? 1.0 : 0;
+    let topY = h - parapet - (roof === 'flat' ? 0 : rise);
+    if (!knownHeight(s)) {
+      // an assumed height is rounded to whole storeys so the cornice never cuts through the top row of windows
+      topY = baseH + Math.max(1, Math.round((topY - baseH) / f.floorH)) * f.floorH;
+      h = topY + parapet + (roof === 'flat' ? 0 : rise);
+    } else if (topY < baseH + 0.5) {
+      topY = baseH + 0.5;
+      h = topY + parapet + (roof === 'flat' ? 0 : rise);
+    }
+    // ground storey, with arched portals on the main front
+    const portals = o.portals ?? (front.len > 14 ? 3 : 1);
+    const skip = new Set();
+    if (portals > 0 && front.len >= 6) {
+      skip.add(front.i);
+      arcadeEdge(sink, front, 0, baseH, { bays: Math.max(portals, Math.round(front.len / 7)), archW: Math.min(2.6, baseH * 0.7), archH: baseH - 0.6, kind: o.portalKind || 'round', thick: 0.6, depth: 1.4 }, baseMat, wood);
+    }
+    sink.add(wallRing(ring, 0, baseH, skip), baseMat);
+    bandRing(sink, ring, 0, 0.3, 0.06, concreteDark); // plinth
+    bandRing(sink, ring, baseH - 0.35, baseH, 0.22, stoneTrim); // string course
+    // upper storeys
+    sink.add(wallRing(ring, baseH, topY), f.mat);
+    if (o.balcony && front.len >= 6) {
+      sink.box(front.len - 2, 0.25, 1.1, stoneTrim, edgeMatrix(front, front.len / 2, baseH + 0.12, 0.55));
+      sink.box(front.len - 2, 0.9, 0.08, dark, edgeMatrix(front, front.len / 2, baseH + 0.7, 1.06));
+    }
+    // cornice(s)
+    bandRing(sink, ring, topY - 0.8, topY, 0.55, stoneTrim);
+    if (o.cornice === 2) bandRing(sink, ring, topY - 1.6, topY - 1.2, 0.3, stoneTrim);
+    if (roof === 'flat') {
+      sink.add(capRing(ring, topY + 0.05), concrete);
+      sink.add(wallRing(ring, topY, h), baseMat); // parapet
+      const inner = offsetRing(ring, -0.35);
+      if (inner) sink.add(wallRing(inner.slice().reverse(), topY + 0.05, h), concreteDark); // its inner face
+      sink.add(capRing(offsetRing(ring, 0.1) || ring, h), stoneTrim);
+      if (o.plant) {
+        const c = centroidOf(ring);
+        if (clearance(ring, c.x, c.z) > 7) { const lc = frame.toLocal(c); sink.box(10, 3.2, 6, concrete, frame.matrix(lc.x, h + 1.6, lc.z)); }
+      }
+    } else if (roof === 'hip') hipRoof(sink, ring, frame, topY, rise, o.roofMat || tile, f.mat);
+    else ridgeRoof(sink, ring, frame, topY, rise, o.roofMat || tile, f.mat);
+    // a corner turret (Modernista villas)
+    if (o.turret) {
+      const v = extremeVertex(ring, 1, 1);
+      const p = insetPoint(ring, v, 3.0);
+      tower(sink, p.x, p.z, frame.th, 4.2, 0, h + 3.5, baseMat, { trim: stoneTrim });
+      sink.add(new THREE.ConeGeometry(3.2, 3.2, 4), tile, new THREE.Matrix4().makeTranslation(p.x, h + 5.1, p.z).multiply(new THREE.Matrix4().makeRotationY(Math.PI / 4 - frame.th)));
+    }
+    sink.collideRing(ring, h, o.cell || 4);
+    return { ring, frame, front, h, topY, baseH };
+  }
+
+  // -------------------------------------------------------------------------------------------------------------------
+  // Bespoke models
+  // -------------------------------------------------------------------------------------------------------------------
+  function catedral(s) {
+    // Catedral Basílica del Sant Esperit: Gothic nave & aisles on the Plaça Vella, the octagonal lantern over the
+    // crossing and the 20th-century bell tower with its spire on the north-west corner
+    const ring = cleanRing(s.ring);
+    const frame = frameOf(ring);
+    const eave = 15;
+    sink.add(wallRing(ring, 0, eave), stonePale);
+    bandRing(sink, ring, 0, 0.8, 0.1, stoneTrim);
+    bandRing(sink, ring, eave - 0.6, eave, 0.4, stoneTrim);
+    // buttresses & lancets along the long walls
+    for (const e of edgesOf(ring)) {
+      if (e.len < 10) continue;
+      const n = Math.max(1, Math.floor(e.len / 5.5));
+      const step = e.len / n;
+      for (let i = 0; i <= n; i++) {
+        const t = Math.min(e.len - 0.6, Math.max(0.6, i * step));
+        sink.box(0.9, 13, 1.2, stonePale, edgeMatrix(e, t, 6.5, 0.6));
+        if (i < n) archDecal(sink, e, t + step / 2, 7.0, 1.4, 5.2, 'pointed', glass, stoneTrim);
+      }
+    }
+    ridgeRoof(sink, ring, frame, eave, 5.5, tile, stonePale);
+    // west front (towards the Plaça Vella): portal & rose window on the edge facing the origin
+    const west = edgesOf(ring).filter((e) => e.len >= 8).sort((p, q) => Math.hypot(p.mx, p.mz) - Math.hypot(q.mx, q.mz))[0];
+    if (west) {
+      archDecal(sink, west, west.len / 2, 0, 3.4, 6.4, 'pointed', wood, stoneTrim);
+      sink.add(new THREE.CircleGeometry(2.8, 24), stoneTrim, edgeMatrix(west, west.len / 2, 12.5, 0.03));
+      sink.add(new THREE.CircleGeometry(2.3, 24), glass, edgeMatrix(west, west.len / 2, 12.5, 0.05));
+    }
+    // lantern over the crossing
+    const c = centroidOf(ring);
+    if (clearance(ring, c.x, c.z) > 6) {
+      sink.add(new THREE.CylinderGeometry(5.2, 5.2, 7.5, 8), stonePale, new THREE.Matrix4().makeTranslation(c.x, eave + 1.5 + 3.75, c.z));
+      sink.add(new THREE.CylinderGeometry(5.6, 5.6, 0.5, 8), stoneTrim, new THREE.Matrix4().makeTranslation(c.x, eave + 9.0, c.z));
+      sink.add(new THREE.ConeGeometry(5.6, 4.2, 8), tile, new THREE.Matrix4().makeTranslation(c.x, eave + 9.25 + 2.1, c.z));
+      sink.box(0.25, 2.4, 0.25, bronze, new THREE.Matrix4().makeTranslation(c.x, eave + 12.5, c.z));
+    }
+    // bell tower, north-west corner
+    const nw = insetPoint(ring, extremeVertex(ring, -1, -1), 6.2);
+    tower(sink, nw.x, nw.z, frame.th, 9.4, 0, 44, stonePale, { trim: stoneTrim, openings: { y: 35, w: 2.2, h: 6.5, kind: 'pointed' }, glass });
+    sink.box(10.2, 0.9, 10.2, stoneTrim, new THREE.Matrix4().makeTranslation(nw.x, 44.45, nw.z).multiply(new THREE.Matrix4().makeRotationY(-frame.th)));
+    sink.add(new THREE.ConeGeometry(4.9, 11, 8), slate, new THREE.Matrix4().makeTranslation(nw.x, 44.9 + 5.5, nw.z));
+    sink.box(0.3, 2.6, 0.3, bronze, new THREE.Matrix4().makeTranslation(nw.x, 51.5, nw.z));
+    sink.box(1.4, 0.3, 0.3, bronze, new THREE.Matrix4().makeTranslation(nw.x, 51.9, nw.z));
+    sink.collideRing(ring, eave, 4);
+  }
+
+  function masiaFreixa(s) {
+    // Masia Freixa (Lluís Muncunill, 1907-1914): the white Modernista masia in the Parc de Sant Jordi, a gallery of
+    // parabolic arches round the ground floor, smaller parabolic windows above, ribbed domes on the roof and the
+    // slender minaret-like tower; glazed green tile accents
+    const ring = cleanRing(s.ring);
+    const frame = frameOf(ring);
+    const galleryH = 4.6, roofY = 8.2;
+    const skip = new Set();
+    for (const e of edgesOf(ring)) {
+      if (e.len < 8.5) continue;
+      skip.add(e.i);
+      const bays = Math.max(2, Math.round((e.len - 1.2) / 3.4));
+      arcadeEdge(sink, e, 0, galleryH, { bays, archW: 2.6, archH: galleryH - 0.5, kind: 'parabolic', thick: 0.5, depth: 2.4, s0: 0.6, len: e.len - 1.2 }, white, white);
+      sink.box(0.6, galleryH, 0.5, white, edgeMatrix(e, 0.3, galleryH / 2, -0.25));
+      sink.box(0.6, galleryH, 0.5, white, edgeMatrix(e, e.len - 0.3, galleryH / 2, -0.25));
+      // the first floor's small parabolic windows above every arch
+      const step = (e.len - 1.2) / bays;
+      for (let i = 0; i < bays; i++) archDecal(sink, e, 0.6 + step * (i + 0.5), galleryH + 0.8, 1.1, 2.5, 'parabolic', glass, null);
+    }
+    sink.add(wallRing(ring, 0, galleryH, skip), white);
+    sink.add(wallRing(ring, galleryH, roofY), white);
+    bandRing(sink, ring, galleryH - 0.3, galleryH, 0.18, white);
+    bandRing(sink, ring, roofY, roofY + 0.4, 0.3, white);
+    bandRing(sink, ring, roofY + 0.4, roofY + 0.75, 0.32, green);
+    sink.add(capRing(ring, roofY + 0.1), whiteRoof);
+    // domes along the long axis wherever the outline is wide enough
+    const hw = frame.w / 2;
+    const spots = [];
+    for (let u = -hw + 3; u <= hw - 3; u += 0.5) {
+      let v0 = Infinity, v1 = -Infinity;
+      for (let v = -frame.d / 2; v <= frame.d / 2; v += 0.25) { const p = frame.toWorld(u, v); if (inRing(ring, p.x, p.z)) { v0 = Math.min(v0, v); v1 = Math.max(v1, v); } }
+      if (v1 - v0 < 4) continue;
+      const v = (v0 + v1) / 2, p = frame.toWorld(u, v);
+      spots.push({ u, v, r: Math.min((v1 - v0) / 2, distToRing(ring, p.x, p.z)) - 0.6 });
+    }
+    const domes = [];
+    const place = (rMax) => {
+      let best = null;
+      for (const sp of spots) {
+        if (sp.r < 1.8 || domes.some((d) => Math.abs(d.u - sp.u) < d.r + Math.min(rMax, sp.r) + 1.2)) continue;
+        if (!best || sp.r > best.r) best = sp;
+      }
+      if (!best) return;
+      const r = Math.min(rMax, best.r);
+      domes.push({ ...best, r });
+      const p = frame.toWorld(best.u, best.v);
+      ribbedDome(sink, p.x, roofY + 0.1, p.z, r, white, green);
+    };
+    place(5.0); place(3.0); place(3.0); place(2.4); place(2.4);
+    // the tower, at the far end of the long axis
+    let tp = null, tu = -Infinity;
+    for (const p of ring) {
+      const q = insetPoint(ring, p, 2.2);
+      const u = frame.toLocal(q).x;
+      if (clearance(ring, q.x, q.z) >= 1.6 && u > tu) { tu = u; tp = q; }
+    }
+    if (tp) {
+      sink.add(new THREE.CylinderGeometry(1.5, 1.6, 19, 16), white, new THREE.Matrix4().makeTranslation(tp.x, 9.5, tp.z));
+      sink.add(new THREE.TorusGeometry(1.9, 0.28, 8, 24), white, new THREE.Matrix4().makeTranslation(tp.x, 17, tp.z).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2)));
+      sink.add(new THREE.CylinderGeometry(1.15, 1.25, 2.4, 12), white, new THREE.Matrix4().makeTranslation(tp.x, 20.2, tp.z));
+      for (let i = 0; i < 4; i++) sink.add(new THREE.ShapeGeometry(archShape(0.6, 1.6, 'parabolic')), glass, new THREE.Matrix4().makeTranslation(tp.x, 19.4, tp.z).multiply(new THREE.Matrix4().makeRotationY((i * Math.PI) / 2)).multiply(new THREE.Matrix4().makeTranslation(0, 0, 1.17)));
+      sink.add(new THREE.ConeGeometry(1.55, 3.2, 12), green, new THREE.Matrix4().makeTranslation(tp.x, 21.4 + 1.6, tp.z));
+      sink.add(new THREE.SphereGeometry(0.3, 10, 8), green, new THREE.Matrix4().makeTranslation(tp.x, 23.2, tp.z));
+      sink.collide(tp.x - 1.7, tp.x + 1.7, tp.z - 1.7, tp.z + 1.7, 23);
+    }
+    sink.collideRing(ring, roofY + 0.75, 4);
+  }
+
+  function torrePalau(s) {
+    // Torre del Palau: the 12th-century keep of the castle-palace of Terrassa, 26.7 m (OSM) on its tiny square plan
+    const ring = cleanRing(s.ring);
+    const frame = frameOf(ring);
+    const h = heightOf(s, 26.7);
+    const size = Math.min(frame.w, frame.d);
+    tower(sink, frame.cx, frame.cz, frame.th, size, 0, h - 1.3, stoneDark, { merlons: true, trim: stoneDark });
+    sink.box(size + 0.4, 0.5, size + 0.4, stoneDark, frame.matrix(0, 11.5, 0));
+    for (let side = 0; side < 4; side++) {
+      for (const y of [9, 17]) {
+        sink.add(new THREE.ShapeGeometry(archShape(0.35, 1.7, 'flat')), glass, frame.matrix().multiply(new THREE.Matrix4().makeRotationY((side * Math.PI) / 2)).multiply(new THREE.Matrix4().makeTranslation(0, y, size / 2 + 0.04)));
+      }
+    }
+  }
+
+  function cartoixa(s) {
+    // Castell Cartoixa de Vallparadís: 12th-century castle turned Carthusian monastery, battlemented stone walls round
+    // the cloister with square towers at the corners and tiled roofs behind the parapet, above the Parc de Vallparadís
+    const ring = cleanRing(s.ring);
+    const frame = frameOf(ring);
+    const wallH = 12;
+    sink.add(wallRing(ring, 0, wallH), stoneDark);
+    bandRing(sink, ring, 0, 1.0, 0.15, stoneDark);
+    bandRing(sink, ring, wallH - 0.5, wallH, 0.3, stoneDark);
+    for (const e of edgesOf(ring)) {
+      if (e.len < 3) continue;
+      const n = Math.max(1, Math.floor(e.len / 2.4));
+      for (let i = 0; i < n; i++) sink.box(1.0, 1.3, 0.6, stoneDark, edgeMatrix(e, (e.len / n) * (i + 0.5), wallH + 0.65, -0.3));
+    }
+    archesAlong(sink, ring, { minLen: 8, spacing: 6, margin: 3, y: 6.5, w: 1.0, h: 2.2, kind: 'round' }, glass, stoneTrim);
+    archesAlong(sink, ring, { minLen: 12, spacing: 6, margin: 3, y: 2.0, w: 0.9, h: 1.9, kind: 'round' }, glass, null);
+    const inner = offsetRing(ring, -0.8);
+    if (inner) ridgeRoof(sink, inner, frame, wallH - 0.9, 2.8, tile, stoneDark);
+    else sink.add(capRing(ring, wallH - 0.5), tile);
+    // corner towers at the outline's corners nearest the frame's corners; the first is the keep
+    const corners = [];
+    for (const [su, sv] of [[1, 1], [-1, -1], [1, -1], [-1, 1]]) {
+      const target = frame.toWorld((su * frame.w) / 2, (sv * frame.d) / 2);
+      let best = null, bd = 7;
+      for (const p of ring) { const d = Math.hypot(p.x - target.x, p.z - target.z); if (d < bd) { bd = d; best = p; } }
+      if (best && !corners.some((q) => Math.hypot(q.x - best.x, q.z - best.z) < 12)) corners.push(best);
+    }
+    corners.forEach((p, i) => {
+      const size = i === 0 ? 7.6 : 6.2;
+      const q = insetPoint(ring, p, size * 0.5);
+      tower(sink, q.x, q.z, frame.th, size, 0, i === 0 ? 21 : 18, stoneDark, { merlons: true, trim: stoneDark, openings: { y: (i === 0 ? 21 : 18) - 5, w: 0.9, h: 2.0 }, glass });
+    });
+    sink.collideRing(ring, wallH, 4);
+  }
+
+  function mercat(s) {
+    // Mercat de la Independència (1908, Antoni Pascual & Melcior Viñals): the Modernista iron-and-brick market hall,
+    // tall arched windows all round, a raised central nave with a clerestory and tiled pitched roofs
+    const ring = cleanRing(s.ring);
+    const frame = frameOf(ring);
+    const wallH = 9.5;
+    sink.add(wallRing(ring, 0, wallH), brick);
+    bandRing(sink, ring, 0, 1.2, 0.12, stoneTrim);
+    bandRing(sink, ring, wallH - 0.5, wallH, 0.4, brickDark);
+    for (const e of edgesOf(ring)) {
+      if (e.len < 10) continue;
+      const n = Math.max(1, Math.floor((e.len - 2) / 4.6));
+      const step = (e.len - 2) / n;
+      for (let i = 0; i <= n; i++) sink.box(0.7, wallH - 1.2, 0.35, brickDark, edgeMatrix(e, 1 + i * step, 1.2 + (wallH - 1.2) / 2, 0.17));
+      for (let i = 0; i < n; i++) archDecal(sink, e, 1 + step * (i + 0.5), 2.4, Math.min(2.8, step - 1.4), 5.4, 'round', glass, stoneTrim);
+    }
+    ridgeRoof(sink, ring, frame, wallH, 1.8, tile, brick);
+    const nave = offsetRing(ring, -5.5);
+    if (nave) {
+      const naveFrame = frameOf(nave);
+      sink.add(wallRing(nave, wallH, wallH + 4), brick);
+      archesAlong(sink, nave, { minLen: 6, spacing: 3, margin: 1.5, y: wallH + 0.9, w: 1.3, h: 2.4, kind: 'round' }, glass, stoneTrim);
+      bandRing(sink, nave, wallH + 3.6, wallH + 4, 0.3, brickDark);
+      ridgeRoof(sink, nave, naveFrame, wallH + 4, 3.2, tile, brick);
+    }
+    // the main entrance: a stone frontispiece with one great arch, on the longest front
+    const front = longestEdge(ring);
+    if (front && front.len > 12) {
+      // proud of the wall by 1 m, the doors 0.1 m in front of the brickwork behind the arch
+      arcadeEdge(sink, front, 0, wallH + 1.0, { bays: 1, archW: 5.0, archH: 7.6, kind: 'round', thick: 1.0, depth: 0.9, s0: front.len / 2 - 4.5, len: 9, off: 1.0 }, stoneTrim, wood);
+      const P = new Poly();
+      P.tri([-4.9, wallH + 1.0, 0], [4.9, wallH + 1.0, 0], [0, wallH + 3.4, 0], [0, 0, 1]);
+      P.tri([-4.9, wallH + 1.0, -1.0], [4.9, wallH + 1.0, -1.0], [0, wallH + 3.4, -1.0], [0, 0, -1]);
+      P.quad([-4.9, wallH + 1.0, -1.0], [-4.9, wallH + 1.0, 0], [0, wallH + 3.4, 0], [0, wallH + 3.4, -1.0], [-0.44, 0.9, 0]);
+      P.quad([4.9, wallH + 1.0, -1.0], [4.9, wallH + 1.0, 0], [0, wallH + 3.4, 0], [0, wallH + 3.4, -1.0], [0.44, 0.9, 0]);
+      sink.add(P.geometry(), stoneTrim, edgeMatrix(front, front.len / 2, 0, 1.0));
+    }
+    sink.collideRing(ring, wallH, 4);
+  }
+
+  function townHall(s, { height, clock = true }) {
+    // Ajuntament de Terrassa & the Antic Ajuntament on the Raval de Montserrat: three civic storeys, a balcony with
+    // the flags over the arched portals and a gable with the clock
+    const built = generic(s, { height, facade: civic, cornice: 2, balcony: true, portals: 3, plant: false });
+    if (!built) return;
+    const { front, h } = built;
+    if (clock && front.len >= 10) {
+      const gable = new THREE.Shape();
+      gable.moveTo(-3.2, 0); gable.lineTo(3.2, 0); gable.lineTo(3.2, 1.6);
+      for (let i = 0; i <= 12; i++) { const a = (Math.PI * i) / 12; gable.lineTo(Math.cos(a) * 3.2, 1.6 + Math.sin(a) * 2.2); }
+      gable.lineTo(-3.2, 0); gable.closePath();
+      const geo = new THREE.ExtrudeGeometry(gable, { depth: 0.7, bevelEnabled: false, curveSegments: 1 });
+      geo.translate(0, 0, -0.7);
+      sink.add(geo, stoneTrim, edgeMatrix(front, front.len / 2, h - 0.6, 0.25));
+      sink.add(new THREE.CircleGeometry(1.25, 24), dark, edgeMatrix(front, front.len / 2, h + 1.2, 0.27));
+      sink.add(new THREE.CircleGeometry(1.1, 24), clockFace, edgeMatrix(front, front.len / 2, h + 1.2, 0.29));
+      sink.box(0.1, 0.9, 0.04, dark, edgeMatrix(front, front.len / 2, h + 1.55, 0.31));
+      sink.box(0.7, 0.1, 0.04, dark, edgeMatrix(front, front.len / 2 + 0.3, h + 1.2, 0.31));
+    }
+    // three flag poles leaning out over the balcony, the flags hanging from their tips
+    const baseY = built.baseH;
+    [-2.6, 0, 2.6].forEach((dx, i) => {
+      const M = edgeMatrix(front, front.len / 2 + dx, baseY + 1.1, 1.0).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 3));
+      sink.add(new THREE.CylinderGeometry(0.04, 0.05, 4.2, 6), steelLight, M.clone().multiply(new THREE.Matrix4().makeTranslation(0, 2.1, 0)));
+      sink.box(0.06, 1.1, 1.3, i === 1 ? flagRed : flagYellow, edgeMatrix(front, front.len / 2 + dx, baseY + 1.1 + 2.1 - 0.5, 1.0 + 3.64 - 0.6));
+    });
+  }
+
+  function vapor(s) {
+    // Vapor Aymerich, Amat i Jover (Lluís Muncunill, 1907-1908), today the mNACTEC: the great textile mill on the Rambla
+    // d'Ègara, one single-storey hall of 11 000 m² under the sawtooth roof of parallel skylights, brick walls with arched
+    // windows between pilasters and the tall brick chimney
+    const ring = cleanRing(s.ring);
+    const frame = frameOf(ring);
+    const wallH = 8.0;
+    sink.add(wallRing(ring, 0, wallH), brick);
+    bandRing(sink, ring, 0, 0.8, 0.1, stoneTrim);
+    bandRing(sink, ring, wallH - 0.45, wallH, 0.3, brickDark);
+    for (const e of edgesOf(ring)) {
+      if (e.len < 9) continue;
+      const n = Math.max(1, Math.floor(e.len / 4.5));
+      const step = e.len / n;
+      for (let i = 0; i <= n; i++) sink.box(0.5, wallH - 0.8, 0.3, brickDark, edgeMatrix(e, Math.min(e.len - 0.25, Math.max(0.25, i * step)), 0.8 + (wallH - 0.8) / 2, 0.15));
+      for (let i = 0; i < n; i++) archDecal(sink, e, step * (i + 0.5), 2.0, Math.min(2.2, step - 1.6), 4.4, 'round', glass, brickDark);
+    }
+    sawtoothRoof(sink, ring, frame, wallH, 2.6, 6.0, tile, glassLight, brick);
+    // the chimney at the north-east corner of the hall
+    const ne = insetPoint(ring, extremeVertex(ring, 1, -1), 7);
+    chimney(sink, ne.x, ne.z, 42, brick, brickDark, true);
+    sink.collideRing(ring, wallH, 8);
+  }
+
+  function teatre(s) {
+    // Teatre Principal (1911, Enric Catà): Modernista theatre, the auditorium under a pitched roof and the tall fly
+    // tower over the stage at the far end from the front
+    const built = generic(s, { height: 15, facade: stucco, cornice: 2, balcony: true, portals: 3, roof: 'ridge', rise: 2.4 });
+    if (!built) return;
+    const { ring, frame, front } = built;
+    const uf = frame.toLocal({ x: front.mx, z: front.mz }).x;
+    const dir = uf >= 0 ? -1 : 1;
+    for (let u = dir * (frame.w / 2 - 7); Math.abs(u) > 2; u -= dir * 1.0) {
+      const p = frame.toWorld(u, 0);
+      if (clearance(ring, p.x, p.z) >= 6.5) {
+        sink.box(13, 26, 12, cream, frame.matrix(u, 13, 0));
+        sink.box(13.6, 0.7, 12.6, stoneTrim, frame.matrix(u, 25.65, 0));
+        sink.collide(p.x - 8, p.x + 8, p.z - 8, p.z + 8, 26);
+        break;
+      }
+    }
+  }
+
+  function santaMaria(s) {
+    // Santa Maria (Seu d'Ègara): the Romanesque church (12th c.) with its lantern over the crossing and the bell tower
+    const ring = cleanRing(s.ring);
+    const frame = frameOf(ring);
+    const eave = 9;
+    sink.add(wallRing(ring, 0, eave), stoneWarm);
+    archesAlong(sink, ring, { minLen: 7, spacing: 4.5, margin: 2, y: 5.0, w: 0.7, h: 1.9, kind: 'round' }, glass, null);
+    bandRing(sink, ring, eave - 0.3, eave, 0.3, stoneWarm);
+    ridgeRoof(sink, ring, frame, eave, 3, tile, stoneWarm);
+    const c = centroidOf(ring);
+    if (clearance(ring, c.x, c.z) > 3.5) {
+      sink.add(new THREE.CylinderGeometry(3.0, 3.0, 4.5, 8), stoneWarm, new THREE.Matrix4().makeTranslation(c.x, eave + 0.5 + 2.25, c.z));
+      sink.add(new THREE.ConeGeometry(3.4, 2.4, 8), tile, new THREE.Matrix4().makeTranslation(c.x, eave + 5.0 + 1.2, c.z));
+    }
+    const nw = insetPoint(ring, extremeVertex(ring, -1, -1), 3.0);
+    tower(sink, nw.x, nw.z, frame.th, 4.6, 0, 17, stoneWarm, { trim: stoneWarm, openings: { y: 13.2, w: 0.9, h: 2.0 }, glass });
+    sink.add(new THREE.ConeGeometry(3.4, 2.6, 4), tile, new THREE.Matrix4().makeTranslation(nw.x, 17.25 + 1.3, nw.z).multiply(new THREE.Matrix4().makeRotationY(Math.PI / 4 - frame.th)));
+    sink.collideRing(ring, eave, 4);
+  }
+
+  function santPere(s) {
+    // Sant Pere (Seu d'Ègara): the parish church, a plain Romanesque nave with the bell gable over the west end
+    const ring = cleanRing(s.ring);
+    const frame = frameOf(ring);
+    const eave = 8;
+    sink.add(wallRing(ring, 0, eave), stoneWarm);
+    archesAlong(sink, ring, { minLen: 7, spacing: 4.5, margin: 2, y: 4.5, w: 0.7, h: 1.8, kind: 'round' }, glass, null);
+    bandRing(sink, ring, eave - 0.3, eave, 0.3, stoneWarm);
+    ridgeRoof(sink, ring, frame, eave, 3, tile, stoneWarm);
+    // the espadanya: a pierced wall with two bells on the ridge, at the west end (towards the origin: -u or +u)
+    const uEnd = frame.toLocal(extremeVertex(ring, -frame.c, -frame.s)).x;
+    const u = uEnd < 0 ? uEnd + 1.2 : uEnd - 1.2;
+    const M = frame.matrix(u, eave + 2.6, 0).multiply(new THREE.Matrix4().makeRotationY(Math.PI / 2));
+    const wall = new THREE.Shape();
+    wall.moveTo(-1.9, 0); wall.lineTo(1.9, 0); wall.lineTo(1.9, 2.6); wall.lineTo(0, 3.4); wall.lineTo(-1.9, 2.6); wall.closePath();
+    for (const dx of [-0.85, 0.85]) {
+      const hole = archShape(0.9, 1.8, 'round');
+      const path = new THREE.Path();
+      hole.getPoints(1).forEach((p, k) => (k ? path.lineTo(p.x + dx, p.y + 0.4) : path.moveTo(p.x + dx, p.y + 0.4)));
+      path.closePath();
+      wall.holes.push(path);
+      sink.add(new THREE.CylinderGeometry(0.22, 0.42, 0.55, 10), bronze, M.clone().multiply(new THREE.Matrix4().makeTranslation(dx, 1.5, 0)));
+    }
+    const geo = new THREE.ExtrudeGeometry(wall, { depth: 0.6, bevelEnabled: false, curveSegments: 1 });
+    geo.translate(0, 0, -0.3);
+    sink.add(geo, stoneWarm, M);
+    sink.collideRing(ring, eave, 4);
+  }
+
+  function santMiquel(s) {
+    // Sant Miquel (Seu d'Ègara): the Visigothic baptistery (6th-7th c.), a square chapel with a central lantern
+    const ring = cleanRing(s.ring);
+    const frame = frameOf(ring);
+    const eave = 7;
+    sink.add(wallRing(ring, 0, eave), stoneWarm);
+    archesAlong(sink, ring, { minLen: 6, spacing: 4, margin: 1.8, y: 3.8, w: 0.6, h: 1.5, kind: 'round' }, glass, null);
+    hipRoof(sink, ring, frame, eave, 2.0, tile, stoneWarm);
+    const c = centroidOf(ring);
+    sink.add(new THREE.CylinderGeometry(2.8, 2.8, 4.6, 8), stoneWarm, new THREE.Matrix4().makeTranslation(c.x, eave + 2.3, c.z));
+    for (let i = 0; i < 8; i++) sink.add(new THREE.ShapeGeometry(archShape(0.5, 1.4, 'round')), glass, new THREE.Matrix4().makeTranslation(c.x, eave + 2.4, c.z).multiply(new THREE.Matrix4().makeRotationY((i * Math.PI) / 4 + Math.PI / 8)).multiply(new THREE.Matrix4().makeTranslation(0, 0, 2.8 * Math.cos(Math.PI / 8) + 0.04)));
+    sink.add(new THREE.ConeGeometry(3.2, 2.5, 8), tile, new THREE.Matrix4().makeTranslation(c.x, eave + 4.6 + 1.25, c.z));
+    sink.collideRing(ring, eave, 4);
+  }
+
+  function mutua(s) {
+    // Hospital Universitari Mútua de Terrassa: the 17-storey, 70 m tower on the Plaça del Doctor Robert (OSM height),
+    // one of the tallest buildings in the city
+    const ring = cleanRing(s.ring);
+    const frame = frameOf(ring);
+    const f = hospitalTower;
+    // 16 windowed storeys over the ground floor: 70 m, the OSM height
+    const h = knownHeight(s) || 70;
+    const front = longestEdge(ring);
+    sink.add(wallRing(ring, 0, f.floorH, new Set([front.i])), cream);
+    arcadeEdge(sink, front, 0, f.floorH, { bays: Math.max(3, Math.round(front.len / 5)), archW: 3.4, archH: f.floorH - 0.6, kind: 'flat', thick: 0.4, depth: 2.0 }, cream, glass);
+    sink.box(front.len * 0.6, 0.3, 4.5, steelLight, edgeMatrix(front, front.len / 2, f.floorH - 0.2, 2.2));
+    const topY = f.floorH + Math.max(1, Math.round((h - f.floorH) / f.floorH)) * f.floorH;
+    sink.add(wallRing(ring, f.floorH, topY), f.mat);
+    bandRing(sink, ring, f.floorH - 0.3, f.floorH, 0.25, stoneTrim);
+    bandRing(sink, ring, topY, topY + 1.1, 0.15, cream);
+    sink.add(capRing(ring, topY + 0.1), concrete);
+    const c = centroidOf(ring);
+    if (clearance(ring, c.x, c.z) > 9) {
+      const lc = frame.toLocal(c);
+      sink.box(14, 4, 9, cream, frame.matrix(lc.x, topY + 2.1, lc.z));
+      sink.box(0.9, 3.0, 0.9, steel, new THREE.Matrix4().makeTranslation(c.x + 3, topY + 5.6, c.z));
+    }
+    sink.collideRing(ring, topY + 1.1, 4);
+  }
+
+  function estadi(s) {
+    // Estadi Municipal Olímpic: the 1992 Olympic hockey stadium, an oval of terraces with a roof over the main stand,
+    // floodlight masts at the corners and the pitch inside. The terraces follow the outline's convex hull (the real
+    // outline has a notch at the entrance that no inward offset survives)
+    const ring = convexHull(cleanRing(s.ring));
+    const frame = frameOf(ring);
+    const offs = [-23, -17, -11, -5, -1];
+    const ys = [1.6, 4.0, 6.4, 8.8, 10.4];
+    const rings = offs.map((d) => shrinkRing(ring, -d));
+    for (let i = 0; i + 1 < rings.length; i++) sink.add(stripRings(rings[i], ys[i], rings[i + 1], ys[i + 1]), i % 2 ? concreteDark : concrete);
+    sink.add(stripRings(rings[rings.length - 1], 10.4, ring, 10.4), concrete); // the top walkway
+    sink.add(wallRing(ring, 0, 11.4), concrete);
+    bandRing(sink, ring, 0, 1.0, 0.1, concreteDark);
+    bandRing(sink, ring, 10.4, 11.4, 0.1, concreteDark);
+    sink.add(wallRing(rings[0].slice().reverse(), 0, 1.6), concreteDark); // the terrace front, seen from the pitch
+    sink.add(capRing(rings[0], 0.08), pitch);
+    sink.add(capRing(rings[0], 1.6, { holes: [shrinkRing(rings[0], 0.6)] }), concreteDark);
+    // the canopy over the main stand (the frame's -v side)
+    const cv = -(frame.d / 2 - 13.5);
+    sink.box(frame.w * 0.4, 0.6, 26, steelLight, frame.matrix(0, 17.5, cv));
+    sink.box(frame.w * 0.4, 1.2, 0.4, steel, frame.matrix(0, 16.6, cv + 12.8));
+    const nCol = Math.round((frame.w * 0.4) / 8);
+    for (let i = 0; i <= nCol; i++) {
+      const u = -frame.w * 0.2 + (frame.w * 0.4 * i) / nCol;
+      sink.add(new THREE.CylinderGeometry(0.35, 0.4, 17.5, 10), steel, frame.matrix(u, 8.75, cv - 12.5));
+    }
+    // floodlights
+    for (const [su, sv] of [[1, 1], [-1, 1], [1, -1], [-1, -1]]) {
+      const p = frame.toWorld(su * (frame.w / 2 - 9), sv * (frame.d / 2 - 9));
+      if (!inRing(ring, p.x, p.z)) continue;
+      sink.add(new THREE.CylinderGeometry(0.35, 0.5, 32, 10), steel, new THREE.Matrix4().makeTranslation(p.x, 16, p.z));
+      sink.box(4.5, 2.6, 0.8, dark, frame.matrix(su * (frame.w / 2 - 9), 31, sv * (frame.d / 2 - 9)));
+      sink.collide(p.x - 0.6, p.x + 0.6, p.z - 0.6, p.z + 0.6, 32);
+    }
+    sink.collideRing(ring, 11.4, 8, rings[0]);
+  }
+
+  function station(s) {
+    // Estació del Nord (Rodalies R4) & Terrassa Est: small station buildings with a canopy over the platform on the
+    // track side (the side away from the streets)
+    const built = generic(s, { height: 7.4, facade: brickFacade, baseMat: cream, portals: 2, roof: 'ridge', rise: 1.8, cornice: 1 });
+    if (!built) return;
+    const { ring, frame } = built;
+    const long = edgesOf(ring).filter((e) => e.len >= frame.w * 0.7);
+    let track = null, best = -1;
+    for (const e of long) {
+      const near = nearestRoads(e.mx + e.nx * 12, e.mz + e.nz * 12, 60);
+      const d = near.length ? near[0].dist : 999;
+      if (d > best) { best = d; track = e; }
+    }
+    if (track) {
+      const L = track.len + 10;
+      sink.box(L, 0.2, 4.6, slate, edgeMatrix(track, track.len / 2, 3.9, 2.9));
+      sink.box(L, 0.3, 0.15, slate, edgeMatrix(track, track.len / 2, 3.65, 5.15));
+      for (let t = -L / 2 + 2; t <= L / 2 - 2; t += 5) sink.add(new THREE.CylinderGeometry(0.12, 0.12, 3.8, 8), steel, edgeMatrix(track, track.len / 2 + t, 1.9, 4.6));
+    }
+  }
+
+  function carillon(s) {
+    // Carrilló del mNACTEC: the slender carillon tower in the mill's grounds, a brick shaft with an open steel belfry
+    const x = s.x, z = s.z;
+    sink.box(2.8, 17, 2.8, brick, new THREE.Matrix4().makeTranslation(x, 8.5, z));
+    sink.box(3.2, 0.4, 3.2, brickDark, new THREE.Matrix4().makeTranslation(x, 17.2, z));
+    for (const dx of [-1.2, 1.2]) for (const dz of [-1.2, 1.2]) sink.box(0.25, 7, 0.25, steel, new THREE.Matrix4().makeTranslation(x + dx, 20.9, z + dz));
+    sink.box(3.0, 0.3, 3.0, steel, new THREE.Matrix4().makeTranslation(x, 24.4, z));
+    sink.add(new THREE.ConeGeometry(2.3, 1.6, 4), slate, new THREE.Matrix4().makeTranslation(x, 25.35, z).multiply(new THREE.Matrix4().makeRotationY(Math.PI / 4)));
+    for (const [dx, dz, r] of [[0, 0, 0.5], [0.8, 0, 0.35], [-0.8, 0, 0.35], [0, 0.8, 0.3], [0, -0.8, 0.3]]) {
+      sink.add(new THREE.CylinderGeometry(r * 0.55, r, r * 1.3, 10), bronze, new THREE.Matrix4().makeTranslation(x + dx, 22.6 - r, z + dz));
+    }
+    sink.collide(x - 1.6, x + 1.6, z - 1.6, z + 1.6, 26);
+  }
+
+  const BESPOKE = {
+    'Catedral del Sant Esperit': catedral,
+    'Masia Freixa': masiaFreixa,
+    'Torre del Palau': torrePalau,
+    'Castell Cartoixa de Vallparadís': cartoixa,
+    'Mercat de la Independència': mercat,
+    'Ajuntament de Terrassa': (s) => townHall(s, { height: 14 }),
+    'Antic Ajuntament de Terrassa': (s) => townHall(s, { height: 13 }),
+    'Teatre Principal': teatre,
+    'Santa Maria': santaMaria,
+    'Sant Pere': santPere,
+    'Sant Miquel': santMiquel,
+    'Hospital Mútua de Terrassa': mutua,
+    'Estadi Municipal Olímpic': estadi,
+    'Estació de Terrassa Estació del Nord (ADIF)': station,
+    'Estació de Terrassa Est': station,
+    'Carrilló del mNACTEC': carillon,
+    'Casa Museu Alegre de Sagrera': (s) => generic(s, { height: 14, facade: stucco, cornice: 2, balcony: true, portals: 1 }),
+    'Museu Tèxtil': (s) => generic(s, { height: 14, facade: stucco, cornice: 2, portals: 3 }),
+    'Gran Casino': (s) => generic(s, { height: 15, facade: stucco, cornice: 2, balcony: true, portals: 3 }),
+    'Casa Baumann': (s) => generic(s, { height: 11, facade: stucco, cornice: 2, balcony: true, portals: 1, turret: true }),
+    'Institut Industrial': (s) => generic(s, { height: 15, facade: civic, cornice: 2, balcony: true, portals: 3 }),
+    'Hospital de Terrassa': (s) => generic(s, { height: 21, facade: hospitalLow, cornice: 1, portals: 0, plant: true, cell: 8 })
+  };
+  for (const n of VAPOR_NAMES) BESPOKE[n] = vapor;
+
+  // Which sites to build: everything city-config models here, plus the mill under the museum's OSM name
+  const names = new Set(MODELLED_LANDMARKS);
+  if (!VAPOR_NAMES.some((n) => names.has(n))) for (const n of VAPOR_NAMES) if (LANDMARK_SITES[n]) { names.add(n); break; }
+  for (const name of names) {
+    const s = LANDMARK_SITES[name];
+    if (!s) continue;
+    const ring = s.ring ? cleanRing(s.ring) : null;
+    if (s.kind === 'chimney' || /^Xemeneia/.test(name)) {
+      chimney(sink, s.x, s.z, heightOf(s, 30), brick, brickDark, (s.h || 0) >= 60 || !!ring);
+      continue;
+    }
+    const build = BESPOKE[name];
+    if (build) {
+      if (ring || name === 'Carrilló del mNACTEC') build({ ...s, ring }); // the outline models need an outline
+    } else if (ring) {
+      generic({ ...s, ring }, { facade: s.kind === 'industrial' || s.kind === 'station' ? brickFacade : civic, roof: s.kind === 'church' ? 'ridge' : 'flat' });
+    }
+  }
+
+  // One mesh per material
+  for (const [mat, geos] of sink.buckets) {
+    const merged = geos.length === 1 ? geos[0] : mergeGeometries(geos, false);
+    if (!merged) continue;
+    const mesh = new THREE.Mesh(merged, mat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    group.add(mesh);
+  }
+
+  scene.add(group);
+  return { group, colliders: sink.colliders };
+}
+
+export { buildLandmarks, GROUP_NAME as LANDMARKS_GROUP_NAME };

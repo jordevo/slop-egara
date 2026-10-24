@@ -1,32 +1,24 @@
-import {
-  ALL_AVENUES,
-  ALL_STREETS,
-  AVENUES,
-  STREETS,
-  ISLAND_BOUNDS,
-  getIslandBoundsAtZ,
-  BLOCKS
-} from './city-config.js';
-import { GEO } from './nyc-geodata.js';
+import { blockAt, onLand, MAJOR_NAME } from './city-config.js';
+import { GEO } from './terrassa-geodata.js';
 
 // js/road-network.js
-// Drivable road graph derived from the ground layout that city-grid.js actually builds: avenue corridors
-// between the raised curbs, cross-street gaps between curb rows, lanes that keep clear of medians, plazas
-// and steam stacks, intersections (signalized where street-details.js mounts signal heads) and the
-// lane-to-lane curves used to drive straight through them or turn.
+// Drivable road graph of Terrassa from the real street centrelines (GEO.roadGraph, tools/geo-roads.mjs): every
+// street's junctions, its lanes (by its real curb-to-curb width and direction of travel) kept clear of the raised
+// curb islands (city-config.js BLOCKS, tested by their real outlines) and of the ground props, the junctions
+// signalised where OpenStreetMap has traffic lights, and the lane-to-lane curves used to drive straight through a
+// junction or turn. The original's street-grid corridors are gone: Terrassa has no grid, so every edge is a
+// "general" (centreline) edge, as Lower Manhattan's were.
 //
 // Conventions: north = -z, east = +x. Every directed edge has a unit direction (dx, dz) and a right normal
 // (rx, rz) = (-dz, dx). Lanes are lateral offsets to the right of the centreline, sorted left to right.
 
 const CELL = 32;
-const Z_MIN = Math.floor(ISLAND_BOUNDS.minZ) - 20; // the detailed island, ~129th St to the Battery
-const Z_MAX = Math.ceil(ISLAND_BOUNDS.maxZ) + 20;
 const LANE_CLEAR = 1.2; // half width each lane keeps free of obstacles
 const CROSSWALK = 2.5; // depth between an intersection box and its stop lines
-const SHORE_MARGIN = 6;
 
 function buildRoadNetwork(sidewalks, obstacles) {
-  // 1. Spatial hash of ground footprints: curbs bound the roads, everything else also blocks pedestrians
+  // 1. Spatial hash of ground props (lamps, trees, kiosks, building colliders...): they block lanes & pedestrians.
+  //    Curbs are the real block outlines (city-config.js blockAt), not rectangles: `sidewalks` is unused.
   const hash = new Map();
   const cellKey = (ix, iz) => (ix + 512) * 1024 + iz + 512;
 
@@ -39,7 +31,6 @@ function buildRoadNetwork(sidewalks, obstacles) {
       }
     }
   }
-  for (const r of sidewalks) insert({ minX: r.minX, maxX: r.maxX, minZ: r.minZ, maxZ: r.maxZ, curb: true });
   for (const r of obstacles) insert(r);
 
   // Calls fn(rect) for every footprint overlapping the box until fn returns true
@@ -56,265 +47,43 @@ function buildRoadNetwork(sidewalks, obstacles) {
     return false;
   }
 
-  function onLand(minX, maxX, minZ, maxZ) {
-    for (const z of [minZ, maxZ]) {
-      const shore = getIslandBoundsAtZ(z);
-      if (minX < shore.westX + SHORE_MARGIN || maxX > shore.eastX - SHORE_MARGIN) return false;
-    }
-    return true;
-  }
+  const onLandBox = (minX, maxX, minZ, maxZ) => onLand(minX, minZ) && onLand(maxX, minZ) && onLand(minX, maxZ) && onLand(maxX, maxZ);
+  const onCurb = (x, z) => !!blockAt(x, z);
+  const curbInBox = (minX, maxX, minZ, maxZ) => onCurb(minX, minZ) || onCurb(maxX, minZ) || onCurb(minX, maxZ) || onCurb(maxX, maxZ) || onCurb((minX + maxX) / 2, (minZ + maxZ) / 2);
 
-  const blocked = (minX, maxX, minZ, maxZ) => !onLand(minX, maxX, minZ, maxZ) || query(minX, maxX, minZ, maxZ, () => true);
-  const walkable = (minX, maxX, minZ, maxZ) => onLand(minX, maxX, minZ, maxZ) && !query(minX, maxX, minZ, maxZ, (r) => !r.curb);
-  const onSidewalk = (x, z) => query(x, x, z, z, (r) => r.curb);
-  // The same test for the centreline streets (4b), which follow the real streets: the rectangles standing in for
-  // irregular sidewalks may reach a little past their curbs, a whole park's bounds take in the streets around it and a
-  // median mall's bounds (Allen St, Chrystie St...) both its roadways, so only a curb right at (x, z), median malls by
-  // their real outline and other obstacles under 50 m across count
-  const MEDIANS = BLOCKS.filter((b) => b.median);
-  const medianBox = (r) => MEDIANS.some((b) => Math.abs(b.minX - r.minX) < 0.6 && Math.abs(b.maxX - r.maxX) < 0.6 && Math.abs(b.minZ - r.minZ) < 0.6 && Math.abs(b.maxZ - r.maxZ) < 0.6);
-  const medianCells = new Map(); // 64 m cells -> the medians reaching into them
-  for (const b of MEDIANS) {
-    for (let ix = Math.floor((b.minX - 2) / 64); ix <= Math.floor((b.maxX + 2) / 64); ix++) {
-      for (let iz = Math.floor((b.minZ - 2) / 64); iz <= Math.floor((b.maxZ + 2) / 64); iz++) {
-        const k = ix * 100000 + iz;
-        if (!medianCells.has(k)) medianCells.set(k, []);
-        medianCells.get(k).push(b);
-      }
-    }
-  }
-  function nearMedian(x, z, clear) {
-    for (const b of medianCells.get(Math.floor(x / 64) * 100000 + Math.floor(z / 64)) || []) {
-      if (x < b.minX - clear || x > b.maxX + clear || z < b.minZ - clear || z > b.maxZ + clear) continue;
-      let inside = false;
-      const P = b.poly;
-      for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
-        const a = P[i];
-        const c = P[j];
-        if ((a.z > z) !== (c.z > z) && x < ((c.x - a.x) * (z - a.z)) / (c.z - a.z) + a.x) inside = !inside;
-        const ex = c.x - a.x;
-        const ez = c.z - a.z;
-        const t = Math.max(0, Math.min(1, ((x - a.x) * ex + (z - a.z) * ez) / (ex * ex + ez * ez || 1)));
-        if (Math.hypot(a.x + ex * t - x, a.z + ez * t - z) < clear) return true;
-      }
-      if (inside) return true;
-    }
-    return false;
-  }
-  const blockedOnStreet = (x, z, clear) => !onLand(x - clear, x + clear, z - clear, z + clear) ||
-    query(x - 0.3, x + 0.3, z - 0.3, z + 0.3, (r) => r.curb) ||
-    nearMedian(x, z, clear) ||
-    query(x - clear, x + clear, z - clear, z + clear, (r) => !r.curb && (r.maxX - r.minX < 50 || r.maxZ - r.minZ < 50) && !medianBox(r));
+  const blocked = (minX, maxX, minZ, maxZ) => !onLandBox(minX, maxX, minZ, maxZ) || curbInBox(minX, maxX, minZ, maxZ) || query(minX, maxX, minZ, maxZ, () => true);
+  const walkable = (minX, maxX, minZ, maxZ) => onLandBox(minX, maxX, minZ, maxZ) && !query(minX, maxX, minZ, maxZ, (r) => !r.curb);
+  const onSidewalk = (x, z) => onCurb(x, z);
+  // A lane point is blocked by a curb island within `clear` of it (the islands' real outlines: medians, corners of
+  // the irregular old-town blocks...) or by a ground prop under 50 m across (whole parks & plazas don't count)
+  const blockedOnStreet = (x, z, clear) => !onLand(x, z) ||
+    onCurb(x, z) || onCurb(x + clear, z) || onCurb(x - clear, z) || onCurb(x, z + clear) || onCurb(x, z - clear) ||
+    query(x - clear, x + clear, z - clear, z + clear, (r) => !r.curb && (r.maxX - r.minX < 50 || r.maxZ - r.minZ < 50));
 
-  // 2. Avenue corridors: the most common curb-to-curb gap around each avenue's nominal x along its own stretches
-  //    (CSCL: an avenue only exists between its ends, e.g. Irving Pl 14th-20th St, so it never claims a neighbour's
-  //    roadway), and the stretches of z (at least 30 m long) where at least one of its lanes is clear. Each stretch
-  //    keeps its real direction: two-way stretches (Central Park West, West End Ave, York Ave...) carry half of the
-  //    lanes each way
+  let nodes = [];
+  // Lane centre offsets (m from the centreline, right positive) a one-way roadway of half width `half` carries
   const laneOffsets = (half) => (half >= 10.0 ? [-7.2, -3.6, 0, 3.6, 7.2]
     : half >= 8.5 ? [-5.4, -1.8, 1.8, 5.4]
       : half >= 6.8 ? [-3.6, 0, 3.6]
         : half >= 4.4 ? [-1.8, 1.8] : null);
-  const avenues = [];
-  for (const ave of ALL_AVENUES) {
-    if (ave.isHighway) continue;
-    const segs = ave.segs || [{ z0: ave.minZ, z1: ave.maxZ, dir: ave.dir }];
-    // the avenue's stretch at z (or the nearest one within an intersection's reach of its ends)
-    const segAt = (z) => {
-      let best = null;
-      let bestD = 15;
-      for (const s of segs) {
-        const d = z < s.z0 ? s.z0 - z : z > s.z1 ? z - s.z1 : 0;
-        if (d <= bestD) {
-          bestD = d;
-          best = s;
-        }
-      }
-      return best;
-    };
-    const votes = new Map();
-    for (let z = Z_MIN; z <= Z_MAX; z += 2) {
-      if (!segAt(z)) continue;
-      let left = -Infinity;
-      let right = Infinity;
-      let inside = false;
-      query(ave.x - 20, ave.x + 20, z, z, (r) => {
-        if (!r.curb) return false;
-        if (r.maxX <= ave.x) left = Math.max(left, r.maxX);
-        else if (r.minX >= ave.x) right = Math.min(right, r.minX);
-        else inside = true;
-        return false;
-      });
-      if (inside || left === -Infinity || right === Infinity) continue;
-      const k = `${left}:${right}`;
-      votes.set(k, (votes.get(k) || 0) + 1);
-    }
-    let best = null;
-    for (const [k, n] of votes) if (!best || n > votes.get(best)) best = k;
-    if (!best) continue;
-    const [left, right] = best.split(':').map(Number);
-    const half = (right - left) / 2;
 
-    // Physical lane offsets from the corridor centre for southbound (+z) and northbound (-z) traffic, by direction
-    // of the stretch (1: southbound, -1: northbound, 0: two-way)
-    let byDir;
-    if (ave.hasMedian) {
-      // Park Ave: three lanes each way either side of the planted malls (lanes in the malls drop out below)
-      const both = { south: [-11.4, -7.8, -4.2], north: [4.2, 7.8, 11.4] };
-      byDir = { 1: both, '-1': both, 0: both };
-    } else {
-      // Real curb-to-curb roadways (CSCL): 21.3 m (8th, 3rd, 1st, 11th Aves) carry five lanes, 18.3 m (7th, 9th,
-      // 10th, 2nd Aves) four, 14.6-15.8 m (5th, Madison, Lexington Aves) three
-      const lanes = laneOffsets(half);
-      if (!lanes) continue;
-      byDir = {
-        1: { south: lanes, north: [] },
-        '-1': { south: [], north: lanes },
-        0: { south: lanes.filter((o) => o < -0.5), north: lanes.filter((o) => o > 0.5) }
-      };
-    }
-    const lanesAt = (z) => {
-      const s = segAt(z);
-      return s ? byDir[Math.sign(s.dir || 0)] : null;
-    };
-
-    const x = (left + right) / 2;
-    const free = new Uint8Array(Z_MAX - Z_MIN + 1);
-    for (let i = 0; i < free.length; i++) {
-      const z = Z_MIN + i;
-      const set = lanesAt(z);
-      if (!set) continue;
-      free[i] = [...set.south, ...set.north].some((o) => !blocked(x + o - LANE_CLEAR, x + o + LANE_CLEAR, z - 0.5, z + 0.5)) ? 1 : 0;
-    }
-    for (let i = 0; i < free.length;) {
-      let j = i;
-      while (j < free.length && free[j] === free[i]) j++;
-      if (free[i] && j - i < 30) free.fill(0, i, j);
-      i = j;
-    }
-    avenues.push({ index: avenues.length, name: ave.short, x, half, lanesAt, free, nodes: [] });
-  }
-  avenues.sort((a, b) => a.x - b.x);
-  console.info('[roads] avenues', avenues.map((a) => `${a.name} x=${a.x.toFixed(1)} half=${a.half.toFixed(1)} free=${(a.free.reduce((s, v) => s + v, 0) / 1000).toFixed(1)}km`).join(' | '));
-
-  // 3. Cross streets: free z intervals of the line joining two neighbouring active avenue corridors
-  const pieces = [];
-  const runs = new Map();
-  for (let i = 0; i <= Z_MAX - Z_MIN; i++) {
-    const z = Z_MIN + i;
-    const seen = new Set();
-    let prev = null;
-    for (const a of avenues) {
-      if (!a.free[i]) continue;
-      if (prev && !blocked(prev.x + prev.half, a.x - a.half, z - 0.5, z + 0.5)) {
-        const k = prev.index * 64 + a.index;
-        seen.add(k);
-        if (!runs.has(k)) runs.set(k, { a: prev, b: a, z0: z });
-      }
-      prev = a;
-    }
-    for (const [k, run] of runs) {
-      if (seen.has(k)) continue;
-      runs.delete(k);
-      const gap = z - run.z0;
-      if (gap >= 7) pieces.push({ a: run.a, b: run.b, z: (run.z0 + z - 1) / 2, gap }); // streets are ~9-10 m curb to curb
-    }
-  }
-
-  // One-way or two-way from the nearest named street inside the gap (majors and wide gaps are two-way)
-  for (const p of pieces) {
-    let st = null;
-    for (const s of ALL_STREETS) {
-      if (Math.abs(s.z - p.z) <= p.gap / 2 && (!st || Math.abs(s.z - p.z) < Math.abs(st.z - p.z))) st = s;
-    }
-    const twoWay = !st || st.dir === 0 || p.gap >= 20;
-    const pair = p.gap >= 17 ? [1.8, 5.4] : [1.8];
-    p.east = twoWay ? pair : st.dir > 0 ? [-1.8, 1.8] : [];
-    p.west = twoWay ? pair : st.dir < 0 ? [-1.8, 1.8] : [];
-  }
-
-  // 4. Intersections: street ends on avenue corridors (merged within 6 m)
-  let nodes = [];
-  function nodeAt(a, z) {
-    for (const n of a.nodes) if (Math.abs(n.z - z) < 6) return n;
-    const n = { x: a.x, z, avenue: a, hx: a.half, hz: 0, signal: false, in: [], out: [] };
-    a.nodes.push(n);
-    nodes.push(n);
-    return n;
-  }
-  for (const p of pieces) {
-    p.half = (p.gap + 1) / 2; // the gap counts the free 1 m steps between the curbs
-    p.from = nodeAt(p.a, p.z);
-    p.to = nodeAt(p.b, p.z);
-    for (const n of [p.from, p.to]) n.hz = Math.max(n.hz, Math.abs(p.z - n.z) + Math.min(p.half, 13));
-  }
-
-  // 4b. Non-grid streets: Lower Manhattan, Broadway and the curved avenues farther north, from
-  //     the street centreline graph (GEO.roadGraph, tools/geo-roadgraph.mjs), minus the links the grid corridors above
-  //     already carry. Its junctions join the grid where they meet it (at a grid intersection, on an avenue corridor or a
-  //     cross street); a street's bends get shape nodes, so every edge stays straight.
-  const genRuns = centrelineStreets();
+  // 2. The streets, from the street centreline graph (GEO.roadGraph, tools/geo-roads.mjs): a junction per graph node
+  //    (junctions a few metres apart merge), a street's bends get shape nodes, so every edge stays straight.
+  const { runs: genRuns, junctionOf } = centrelineStreets();
   function centrelineStreets() {
     const RG = GEO.roadGraph;
     const runs = [];
-    if (!RG) return runs;
+    if (!RG) return { runs, junctionOf: () => null };
     const pos = [];
     for (let i = 0; i < RG.nodes.length; i += 2) pos.push({ x: RG.nodes[i], z: RG.nodes[i + 1] });
-    const pieceRows = new Map();
-    for (const p of pieces) {
-      const k = Math.floor(p.z / 16);
-      for (const kk of [k - 1, k, k + 1]) {
-        if (!pieceRows.has(kk)) pieceRows.set(kk, []);
-        pieceRows.get(kk).push(p);
-      }
-    }
-    // The grid corridor at (x, z): an avenue's free stretch, or a cross street between two avenues (`inner`: clear of
-    // the avenues' roadways)
-    const aveAt = (x, z, margin) => {
-      const i = Math.round(z) - Z_MIN;
-      for (const a of avenues) if (Math.abs(x - a.x) <= a.half + margin && i >= 0 && i < a.free.length && a.free[i]) return a;
-      return null;
-    };
-    const pieceAt = (x, z, margin, inner) => {
-      for (const p of pieceRows.get(Math.floor(z / 16)) || []) {
-        if (Math.abs(z - p.z) > p.half + margin) continue;
-        if (inner ? x > p.a.x + p.a.half + 4 && x < p.b.x - p.b.half - 4 : x > p.a.x - 2 && x < p.b.x + 2) return p;
-      }
-      return null;
-    };
-    // Points every 4 m along a polyline, 7 m clear of its ends, with the direction there
-    function samples(pts, fn) {
-      let total = 0;
-      for (let k = 0; k + 1 < pts.length; k++) total += Math.hypot(pts[k + 1].x - pts[k].x, pts[k + 1].z - pts[k].z);
-      const from = Math.min(7, total / 2);
-      let s0 = 0;
-      for (let k = 0; k + 1 < pts.length; k++) {
-        const a = pts[k];
-        const b = pts[k + 1];
-        const L = Math.hypot(b.x - a.x, b.z - a.z);
-        if (L < 1e-6) continue;
-        for (let s = Math.max(from, Math.ceil(s0 / 4) * 4); s <= Math.min(s0 + L, total - from); s += 4) {
-          const t = (s - s0) / L;
-          fn(a.x + (b.x - a.x) * t, a.z + (b.z - a.z) * t, (b.x - a.x) / L, (b.z - a.z) / L);
-        }
-        s0 += L;
-      }
-      return total;
-    }
-    // Links the grid already carries: most of their length runs along an avenue (north-south) or a cross street
     const links = [];
-    for (const [a, b, ni, w, lanes, dir, inner] of RG.links) {
+    for (const [a, b, ni, w, lanes, dir, inner, cls] of RG.links) {
       const pts = [pos[a]];
       for (let k = 0; k < inner.length; k += 2) pts.push({ x: inner[k], z: inner[k + 1] });
       pts.push(pos[b]);
-      let n = 0;
-      let hit = 0;
-      const len = samples(pts, (x, z, dx, dz) => {
-        n++;
-        if ((Math.abs(dz) > 0.94 && aveAt(x, z, 1.5)) || (Math.abs(dx) > 0.94 && pieceAt(x, z, 1.5, false))) hit++;
-      });
-      if (n && hit > n * 0.5) continue;
-      links.push({ a, b, name: RG.names[ni], w, lanes, dir, pts, len });
+      let len = 0;
+      for (let k = 0; k + 1 < pts.length; k++) len += Math.hypot(pts[k + 1].x - pts[k].x, pts[k + 1].z - pts[k].z);
+      links.push({ a, b, name: RG.names[ni], w, lanes, dir, cls: cls || 0, pts, len });
     }
     // Junctions a few metres apart (divided roads, offset corners) are one: collapse links under 14 m
     const parent = pos.map((_, i) => i);
@@ -334,65 +103,27 @@ function buildRoadNetwork(sidewalks, obstacles) {
         sum.set(r, s);
       }
     }
-    // A junction joins the grid at a grid intersection within 12 m, on an avenue corridor or a cross street it lies on,
-    // or stands on its own
+    // A junction per merged group of graph nodes, at their mean position
     const junctions = new Map();
-    const gridCells = new Map(); // 32 m cells -> grid nodes
-    const indexNode = (g) => {
-      const k = Math.floor(g.x / 32) * 100000 + Math.floor(g.z / 32);
-      if (!gridCells.has(k)) gridCells.set(k, []);
-      gridCells.get(k).push(g);
-    };
-    for (const g of nodes) indexNode(g);
     function junction(r) {
       if (junctions.has(r)) return junctions.get(r);
       const s = sum.get(r);
-      const x = s.x / s.n;
-      const z = s.z / s.n;
-      let node = null;
-      let bd = 12;
-      for (let ix = Math.floor((x - 12) / 32); ix <= Math.floor((x + 12) / 32); ix++) {
-        for (let iz = Math.floor((z - 12) / 32); iz <= Math.floor((z + 12) / 32); iz++) {
-          for (const g of gridCells.get(ix * 100000 + iz) || []) {
-            const d = Math.hypot(g.x - x, g.z - z);
-            if (d < bd) {
-              bd = d;
-              node = g;
-            }
-          }
-        }
-      }
-      if (!node) {
-        const a = aveAt(x, z, 3);
-        if (a) {
-          node = nodeAt(a, z);
-          node.hz = Math.max(node.hz, 7);
-          indexNode(node);
-        }
-      }
-      if (!node) {
-        const p = pieceAt(x, z, 3, true);
-        if (p) {
-          node = { x, z: p.z, hx: 7, hz: p.half, signal: false, in: [], out: [] };
-          nodes.push(node);
-          (p.mids || (p.mids = [])).push(node);
-          indexNode(node);
-        }
-      }
-      if (!node) {
-        node = { x, z, hx: 0, hz: 0, signal: false, in: [], out: [], general: true };
-        nodes.push(node);
-      }
+      const node = { x: s.x / s.n, z: s.z / s.n, hx: 0, hz: 0, signal: false, stop: false, in: [], out: [], general: true };
+      nodes.push(node);
       junctions.set(r, node);
       return node;
     }
-    // Lanes by the street's real curb-to-curb width and direction of travel: one-way streets as wide as the grid's
-    // (two lanes from ~9 m), two-way ones a lane each way (two each way from 17 m). Wide or named avenues are major.
-    const MAJOR = /\bAVE\b|AVENUE|BROADWAY|BOWERY|BLVD|PARK ROW/;
+    // Lanes by the street's real curb-to-curb width and direction of travel: a one-way residential street of the
+    // Eixample (~5.9 m: a travel lane and a parking lane) carries one lane down its middle, two from ~8.8 m; two-way
+    // streets a lane each way (two each way from 17 m). Avenues, ramblas, passeigs, carreteres & rondes and every
+    // primary / secondary / motorway class road are major ('ave': the right of way at unsignalised junctions, where
+    // the buses run, the paint's wide-road markings).
+    const MAJOR = MAJOR_NAME;
     function lanesOf(l) {
-      const w = l.w > 3 ? l.w : MAJOR.test(l.name) ? 18 : 9.1;
+      const major = l.cls === 1 || l.cls === 2 || MAJOR.test(l.name);
+      const w = l.w > 3 ? l.w : major ? 12 : 6;
       const half = w / 2;
-      const axis = w >= 14.5 || l.lanes >= 3 || MAJOR.test(l.name) ? 'ave' : 'st';
+      const axis = w >= 10.5 || l.lanes >= 3 || major ? 'ave' : 'st';
       if (l.dir !== 0) {
         const lanes = laneOffsets(half) || [0];
         return { half, axis, fwd: l.dir > 0 ? lanes : [], back: l.dir < 0 ? lanes : [] };
@@ -427,8 +158,8 @@ function buildRoadNetwork(sidewalks, obstacles) {
       const lanes = lanesOf(l);
       for (let k = 0; k + 1 < stations.length; k++) runs.push({ from: stations[k], to: stations[k + 1], ...lanes });
     }
-    console.info(`[roads] centreline streets: ${links.length} links not on the grid, ${runs.length} straight runs`);
-    return runs;
+    console.info(`[roads] streets: ${links.length} links, ${nodes.length} junctions, ${runs.length} straight runs`);
+    return { runs, junctionOf: (i) => junctions.get(find(i)) || null };
   }
 
   // 5. Directed edges between intersections, keeping only the lanes clear of obstacles node to node
@@ -447,30 +178,6 @@ function buildRoadNetwork(sidewalks, obstacles) {
     });
     if (!open.length) return;
     edges.push({ from, to, axis, x0, z0, dx, dz, rx: -dz, rz: dx, span, half, lanes: open.sort((p, q) => p - q), moves: [] });
-  }
-  for (const a of avenues) {
-    a.nodes.sort((m, n) => m.z - n.z);
-    for (let k = 0; k + 1 < a.nodes.length; k++) {
-      const n0 = a.nodes[k];
-      const n1 = a.nodes[k + 1];
-      let connected = true;
-      for (let z = Math.ceil(n0.z); z <= n1.z && connected; z++) connected = a.free[z - Z_MIN] === 1;
-      if (!connected) continue;
-      const set = a.lanesAt((n0.z + n1.z) * 0.5) || a.lanesAt(n0.z) || a.lanesAt(n1.z);
-      if (!set) continue;
-      addEdge(n0, n1, 'ave', a.x, n0.z, a.x, n1.z, set.south.map((o) => -o), a.half);
-      addEdge(n1, n0, 'ave', a.x, n1.z, a.x, n0.z, set.north, a.half);
-    }
-  }
-  for (const p of pieces) {
-    // a cross street runs between its two avenue nodes, through any centreline junctions on it (see 4b)
-    const chain = [p.from, ...(p.mids || []).sort((m, n) => m.x - n.x), p.to];
-    for (let k = 0; k + 1 < chain.length; k++) {
-      const m = chain[k];
-      const n = chain[k + 1];
-      addEdge(m, n, 'st', m.x, p.z, n.x, p.z, p.east, p.half);
-      addEdge(n, m, 'st', n.x, p.z, m.x, p.z, p.west, p.half);
-    }
   }
   // Centreline streets: any direction, so their lanes are checked for obstacles every 2.5 m (clear of the junctions,
   // where neighbouring corners would get in the way of the test) instead of over one bounding box
@@ -924,6 +631,9 @@ function buildRoadNetwork(sidewalks, obstacles) {
     for (const r of roads) if (r.group < 0) r.group = groups++;
     for (const r of roads) for (const m of r.members) m.group = r.group;
     n.groupCount = Math.max(2, groups);
+    // the right-of-way group of the road over each side's crosswalk (traffic.js: whose WALK the crosswalk gets)
+    n.sideGroup = new Array(n.sideCount).fill(-1);
+    for (const a of arms) n.sideGroup[a.side] = a.group;
   }
 
   // A short link squeezed between two corners may leave its stop line inside the road crossing ahead, where whoever
@@ -1070,12 +780,20 @@ function buildRoadNetwork(sidewalks, obstacles) {
   nodes = nodes.filter((n) => n.in && n.out);
   nodes.forEach((n, i) => (n.id = i));
 
-  // 8. Signalized intersections are exactly the ones with signal heads (street-details.js)
-  for (const a of AVENUES) {
-    for (const s of STREETS) {
-      const n = nodes.find((m) => Math.abs(m.x - a.x) < 4 && Math.abs(m.z - s.z) < 4);
-      if (n) n.signal = true;
+  // 8. Signalised junctions: the graph nodes OpenStreetMap marks with traffic lights (street-details.js mounts the
+  //    signal heads at the same nodes); stop / give-way signs are kept for the right of way
+  {
+    const RG = GEO.roadGraph || {};
+    let signals = 0;
+    for (const i of RG.signals || []) {
+      const n = junctionOf(i);
+      if (n && n.in && n.out && !n.shape) { if (!n.signal) signals++; n.signal = true; }
     }
+    for (const i of RG.stops || []) {
+      const n = junctionOf(i);
+      if (n) n.stop = true;
+    }
+    console.info(`[roads] ${signals} signalised junctions of ${nodes.length}`);
   }
 
   // 9. Sides & right of way at each node, for traffic.js. Its arms are its sides (one crosswalk and approach each): a

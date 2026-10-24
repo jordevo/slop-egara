@@ -40,20 +40,27 @@ function createPedestrianRoutes({ walkable, onSidewalk }, blockAt) {
     return result;
   }
 
+  // Crosswalks of a signalised junction: one across every road arriving at it, just outside that road's stop line
+  // (traffic.js fills n.road[side] with the edge arriving or leaving over each side's crosswalk; the roads meet at any
+  // angle, so each crosswalk runs along its own road's lateral axis). Two walking lines, 1.5 m apart.
   function across(n) {
     if (crossings.has(n)) return crossings.get(n);
     const result = [];
     crossings.set(n, result);
-    if (!n.signal) return result;
-    for (let side = 0; side < 4; side++) {
-      const road = n.road[side];
-      if (!road) continue;
-      const avenue = side >= 2, sign = side % 2 === 0 ? 1 : -1;
-      for (const line of avenue ? [sign * 0.75] : [-0.75, 0.75]) {
-        const a = { x: avenue ? road.x0 - road.half - 2 : n.x + sign * (n.hx + 1.25) + line,
-          z: avenue ? n.z + sign * (n.hz + 1.25) + line : road.z0 - road.half - 2 };
-        const len = road.half * 2 + 4;
-        const b = { x: a.x + (avenue ? len : 0), z: a.z + (avenue ? 0 : len) };
+    if (!n.signal || !n.road) return result;
+    for (let side = 0; side < n.road.length; side++) {
+      const e = n.road[side];
+      if (!e) continue;
+      // the crosswalk's centre: 1.25 m beyond the stop line of the edge arriving here (or before the start of the one
+      // leaving), its direction across the road = the edge's right normal
+      const arriving = e.to === n;
+      const cx = arriving ? e.sx + e.dx * (e.len + 1.25) : e.sx - e.dx * 1.25;
+      const cz = arriving ? e.sz + e.dz * (e.len + 1.25) : e.sz - e.dz * 1.25;
+      const reach = e.half + 2; // from kerb to kerb, 2 m onto each sidewalk
+      for (const line of [-0.75, 0.75]) {
+        const ox = e.dx * line, oz = e.dz * line;
+        const a = { x: cx + ox - e.rx * reach, z: cz + oz - e.rz * reach };
+        const b = { x: cx + ox + e.rx * reach, z: cz + oz + e.rz * reach };
         if (!onSidewalk(a.x, a.z) || !onSidewalk(b.x, b.z) || !clear(a, b)) continue;
         result.push(segment(a, b, { node: n, side, line, from: n, to: n }));
       }

@@ -1,103 +1,50 @@
-// Part 3: real Manhattan blocks ("curb islands") from the street centerline, by rasterising every at-grade roadway at
-// its curb-to-curb width over the land (minus a waterfront strip), then labelling what's left.
-// Each block: curb outline polygon, axis-aligned lot rects inside its property line (curb minus sidewalk), metadata.
+// Part 4: the real blocks of Terrassa ("curb islands") from the street centrelines, by rasterising every at-grade
+// roadway at its curb-to-curb width over the land (the detail box), then labelling what's left. Each block: curb outline
+// polygon, axis-aligned lot rects inside its property line (curb minus sidewalk), frontage frames for the blocks that
+// don't follow the frame's axes, its land-use shares (park, wood, farm, industry...) and its neighbourhood.
 import { geo, Raster, rdpRing, ringArea, bbox, log } from './geo-base.mjs';
-import { pieces } from './geo-streets.mjs';
+import { pieces } from './geo-roads.mjs';
+import { landuse, water, rail, CLS } from './geo-features.mjs';
 
-export const CUT_Z = -7090; // detailed island south of here (≈ 129th St); Upper Manhattan beyond is low-detail
-export const STRIP = 20; // waterfront strip kept clear of blocks (esplanade + shore highway), metres in from the bulkhead
-export const SIDEWALK = 4.6; // property line in from the curb (15 ft)
+export const SIDEWALK = 2.4; // property line in from the curb (m): Terrassa's sidewalks run 1.5-3 m
 const RES = 1;
 
-// --- Roadways that bound blocks ----------------------------------------------------------------------------------------
-const PARK_ROADS = /^(EAST DR|WEST DR|CENTER DR|\d+ ST TRANSVERSE|CENTRAL PARK GREAT HL|CENTRAL RD)$/;
-const HIGHWAYS = /^(FRANKLIN D ROOSEVELT DR|FDR DR {2}VIADUCT|HARLEM RIVER DR|HARLEM RIVER DY|HENRY HUDSON PKWY|BATTERY PARK UNDERPASS)$/;
-function roadWidth(p) {
-  if (p.w > 3) return p.w;
-  if (/AVE|BLVD|BROADWAY|DR$/.test(p.name)) return 18;
-  return 9.1;
+// --- Roadways that bound blocks: every at-grade (and bridge-level, see HOW_TO_IMPROVE.md §2.2) street, plus the
+// railways at grade, which split blocks like streets do
+const roads = pieces.filter((p) => p.bounds).map((p) => ({ x0: p.x0, z0: p.z0, x1: p.x1, z1: p.z1, r: p.w / 2, name: p.name }));
+for (const r of rail) {
+  if (r.bridge) continue;
+  for (let i = 0; i + 1 < r.pts.length; i++) roads.push({ x0: r.pts[i][0], z0: r.pts[i][1], x1: r.pts[i + 1][0], z1: r.pts[i + 1][1], r: 4, name: 'rail' });
 }
-const roads = [];
-for (const p of pieces) {
-  if (p.level !== '13') continue; // at grade (from-level; ramps & viaducts drop out below)
-  const atGradeStreet = p.rw === '1' && !PARK_ROADS.test(p.name) && !HIGHWAYS.test(p.name) && !/DRIVEWAY|PEDESTRIAN|ALLEY/.test(p.name);
-  const surface9A = p.rw === '2' && /^(WEST ST|12 AVE|11 AVE)$/.test(p.name); // Route 9A at grade bounds the west side blocks
-  const plaza = p.rw === '6' && p.name === 'BROADWAY'; // Broadway's pedestrian plazas (Times Sq, Herald Sq...)
-  if (!atGradeStreet && !surface9A && !plaza) continue;
-  roads.push({ x0: p.x0, z0: p.z0, x1: p.x1, z1: p.z1, r: roadWidth(p) / 2, name: p.name });
-}
-// Broadway's pedestrian plazas aren't in the centerline (Times Square 42nd-47th St, Herald & Greeley Squares
-// 33rd-35th St): bridge each gap with a straight piece between the Broadway ends on either side
-export const PLAZAS = [];
-{
-  const bw = roads.filter((s) => s.name === 'BROADWAY');
-  const ends = [];
-  for (const s of bw) ends.push([s.x0, s.z0], [s.x1, s.z1]);
-  const nearestEnd = (z, below) => {
-    let best = null;
-    for (const e of ends) {
-      if (below ? e[1] < z - 3 || e[1] > z + 40 : e[1] > z + 3 || e[1] < z - 40) continue;
-      if (!best || Math.abs(e[1] - z) < Math.abs(best[1] - z)) best = e;
-    }
-    return best;
-  };
-  for (const [name, zN, zS] of [['Times Square', -402, 0], ['Herald Square', 556, 726]]) {
-    const a = nearestEnd(zN, false), b = nearestEnd(zS, true);
-    if (!a || !b) continue;
-    roads.push({ x0: a[0], z0: a[1], x1: b[0], z1: b[1], r: 9, name: 'BROADWAY', plaza: name });
-    PLAZAS.push({ name, a, b, w: 18 });
-  }
-}
-log(`${roads.length} at-grade roadway pieces`);
+log(`${roads.length} block-bounding roadway pieces`);
 
-// --- Land: the bulkhead ring eroded by the waterfront strip ------------------------------------------------------------
-const mb = bbox(geo.manhattan);
-const land2 = new Raster(mb.x0 - 10, Math.max(mb.z0, CUT_Z - 400) - 10, mb.x1 + 10, mb.z1 + 10, 2);
-land2.fillRing(geo.manhattan, 1);
-{
-  const toWater = land2.edt((v) => v === 0);
-  const rc = (STRIP / 2) ** 2;
-  for (let i = 0; i < land2.d.length; i++) land2.d[i] = toWater[i] > rc ? 1 : 0;
-}
-land2.keepLargest();
-const innerRing = rdpRing(land2.traceOuter(), 1.0);
-log(`inner land ring (strip ${STRIP} m): ${innerRing.length} pts`);
-
-// --- 1 m buildable raster -------------------------------------------------------------------------------------------
+// --- Land: the detail box -------------------------------------------------------------------------------------------
+const landRing = geo.detailBox;
+const mb = bbox(landRing);
 const X0 = Math.floor(mb.x0) - 4, X1 = Math.ceil(mb.x1) + 4;
-const Z0 = CUT_Z, Z1 = Math.ceil(mb.z1) + 4;
+const Z0 = Math.floor(mb.z0) - 4, Z1 = Math.ceil(mb.z1) + 4;
 const R = new Raster(X0, Z0, X1, Z1, RES);
-R.fillRing(innerRing, 1);
+R.fillRing(landRing, 1);
 const W = R.w, H = R.h, D = R.d;
-// Stamp each roadway as a capsule
-for (const s of roads) {
-  const ix0 = Math.max(0, Math.floor((Math.min(s.x0, s.x1) - s.r - R.x0) / RES));
-  const ix1 = Math.min(W - 1, Math.ceil((Math.max(s.x0, s.x1) + s.r - R.x0) / RES));
-  const iz0 = Math.max(0, Math.floor((Math.min(s.z0, s.z1) - s.r - R.z0) / RES));
-  const iz1 = Math.min(H - 1, Math.ceil((Math.max(s.z0, s.z1) + s.r - R.z0) / RES));
-  if (ix0 > ix1 || iz0 > iz1) continue;
-  const dx = s.x1 - s.x0, dz = s.z1 - s.z0;
-  const L2 = dx * dx + dz * dz || 1e-9;
-  const r2 = s.r * s.r;
-  for (let j = iz0; j <= iz1; j++) {
-    const pz = R.z0 + (j + 0.5) * RES;
-    for (let i = ix0; i <= ix1; i++) {
-      const k = j * W + i;
-      if (!D[k]) continue;
-      const px = R.x0 + (i + 0.5) * RES;
-      let t = ((px - s.x0) * dx + (pz - s.z0) * dz) / L2;
-      t = t < 0 ? 0 : t > 1 ? 1 : t;
-      const ex = s.x0 + t * dx - px, ez = s.z0 + t * dz - pz;
-      if (ex * ex + ez * ez <= r2) D[k] = 0;
-    }
-  }
-}
+log(`buildable raster ${W} x ${H} cells at ${RES} m`);
+for (const s of roads) R.stampCapsule(s.x0, s.z0, s.x1, s.z1, s.r, 0, 1);
+
+// --- Land-use class raster (2 m): big polygons first, smaller ones override; streams & railways stamped on top --------
+const CR = 2;
+const C = new Raster(X0, Z0, X1, Z1, CR);
+const CI = new Raster(X0, Z0, X1, Z1, CR, Int32Array); // index + 1 of the named polygon under each cell
+landuse.forEach((l, i) => {
+  C.fillPolygon([l.outer, ...l.inners], l.cls);
+  if (l.name) CI.fillPolygon([l.outer, ...l.inners], i + 1);
+});
+for (const s of water) for (let i = 0; i + 1 < s.pts.length; i++) C.stampCapsule(s.pts[i][0], s.pts[i][1], s.pts[i + 1][0], s.pts[i + 1][1], s.w / 2, CLS.WATER);
+for (const r of rail) for (let i = 0; i + 1 < r.pts.length; i++) C.stampCapsule(r.pts[i][0], r.pts[i][1], r.pts[i + 1][0], r.pts[i + 1][1], 5, CLS.RAILWAY);
 
 // --- Label curb islands (4-connected) --------------------------------------------------------------------------------
 const lab = new Int32Array(W * H);
 const comps = [];
 {
-  const stack = new Int32Array(W * H > 4e7 ? 4e7 : W * H);
+  const stack = new Int32Array(Math.min(W * H, 6e7));
   for (let s0 = 0; s0 < W * H; s0++) {
     if (!D[s0] || lab[s0]) continue;
     const id = comps.length + 1;
@@ -122,7 +69,7 @@ const comps = [];
 }
 log(`${comps.length} curb islands labelled`);
 
-// --- Contour of one component (corner walk keeping the component on the right, as Raster.traceOuter) ---------------
+// --- Contour of one component (corner walk keeping the component on the right) --------------------------------------
 function traceComponent(c) {
   const at = (i, j) => (i >= 0 && j >= 0 && i < W && j < H && lab[j * W + i] === c.id ? 1 : 0);
   const si = c.start % W, sj = (c.start - si) / W;
@@ -142,7 +89,7 @@ function traceComponent(c) {
     else { left = at(cx - 1, cz - 1); right = at(cx, cz - 1); }
     if (left && right) dir = (dir + 3) % 4;
     else if (!right) dir = (dir + 1) % 4;
-    if (++guard > 4e6) break;
+    if (++guard > 2e7) break;
   } while (cx + ',' + cz + ',' + dir !== start);
   const out = [];
   for (let i = 0; i < pts.length; i++) {
@@ -151,9 +98,7 @@ function traceComponent(c) {
   }
   return destair(out, RES * 1.5);
 }
-
-// Raster stairs -> lines: short edges (stair steps) are replaced by their midpoints, vertices between two long edges
-// (true corners) are kept
+// Raster stairs -> lines: short edges (stair steps) are replaced by their midpoints, true corners are kept
 export function destair(out, short) {
   const n = out.length;
   const len = (i) => { const a = out[i], b = out[(i + 1) % n]; return Math.abs(b[0] - a[0]) + Math.abs(b[1] - a[1]); };
@@ -167,16 +112,15 @@ export function destair(out, short) {
   return res;
 }
 
-// --- Property line: square erosion of each island by the sidewalk width (keeps grid blocks rectangular) -------------
+// --- Property line: square erosion of each island by the sidewalk width ----------------------------------------------
 const ER = Math.round(SIDEWALK / RES);
 const prop = new Uint8Array(W * H);
 {
-  // erosion along x then z with running counts of non-matching cells (same label required)
   const tmp = new Uint8Array(W * H);
+  const left = new Int32Array(W), right = new Int32Array(W);
   for (let j = 0; j < H; j++) {
     const row = j * W;
-    let run = 0; // consecutive same-label cells ending at i
-    const left = new Int32Array(W), right = new Int32Array(W);
+    let run = 0;
     for (let i = 0; i < W; i++) {
       const L = lab[row + i];
       run = L && i > 0 && lab[row + i - 1] === L ? run + 1 : L ? 1 : 0;
@@ -208,10 +152,10 @@ const prop = new Uint8Array(W * H);
   }
 }
 
-// --- Greedy axis-aligned lot rects in a component's property region (largest rectangle in a histogram) ---------------
-// maskRects: on a w x h 0/1 mask (cleared as it goes), up to maxRects rects [i0, i1, j0, j1] (cells, inclusive) of at
-// least minSide x minSide cells and 120 cells, until 93% of the mask is covered
-function maskRects(m, w, h, maxRects = 8, minSide = 8) {
+// --- Greedy axis-aligned rects in a 0/1 mask (largest rectangle in a histogram), cleared as it goes -------------------
+// Up to maxRects rects [i0, i1, j0, j1] (cells, inclusive) of at least minSide x minSide cells and minArea cells, until
+// `cover` of the mask is covered
+export function maskRects(m, w, h, maxRects = 8, minSide = 8, minArea = 120, cover = 0.93) {
   let total = 0;
   for (let k = 0; k < w * h; k++) total += m[k];
   const rects = [];
@@ -231,7 +175,6 @@ function maskRects(m, w, h, maxRects = 8, minSide = 8) {
           const height = hist[top];
           const left = sp ? stack[sp - 1] + 1 : 0;
           const width = i - left;
-          // lots need some depth both ways: penalise slivers
           if (height >= minSide && width >= minSide) {
             const area = height * width;
             if (area > best) { best = area; bi0 = left; bi1 = i - 1; bj0 = j - height + 1; bj1 = j; }
@@ -240,11 +183,11 @@ function maskRects(m, w, h, maxRects = 8, minSide = 8) {
         stack[sp++] = i;
       }
     }
-    if (best < 120 || (rects.length && best < total * 0.06)) break;
+    if (best < minArea || (rects.length && best < total * 0.06)) break;
     rects.push([bi0, bi1, bj0, bj1]);
     covered += best;
     for (let j = bj0; j <= bj1; j++) for (let i = bi0; i <= bi1; i++) m[j * w + i] = 0;
-    if (covered > total * 0.93) break;
+    if (covered > total * cover) break;
   }
   return { rects, total, covered };
 }
@@ -263,13 +206,9 @@ function lotRects(c, maxRects = 8) {
   };
 }
 
-// --- Frontage frames of irregular islands (Lower Manhattan, Broadway's diagonals...) ---------------------------------
-// The street directions an island fronts: its outline's edge directions modulo 90°, length-weighted, in up to 3
-// clusters ±7° wide. Every island cell joins the cluster of its nearest outline edge; each cluster's cells are then
-// re-rasterised in a frame turned to its direction, eroded by the sidewalk width there (so a diagonal property line
-// sits exactly SIDEWALK in from its curb) and covered with lot rects in that frame, which buildings.js fills like a
-// grid block and turns back into place. Returns [[θ, px, pz, rects], ...] with world = p + R_y(θ)·(local − p)
-// (three.js rotation about +y), or null for an island fronting the grid alone.
+// --- Frontage frames of islands that don't follow the frame's axes (the old town, the Rambla, the outer barris) -----
+// (unchanged from the original: see the comment there) Returns [[θ, px, pz, rects], ...] with
+// world = p + R_y(θ)·(local − p), or null for an island fronting the grid alone.
 const DEG = Math.PI / 180;
 const wrap90 = (a) => ((((a + Math.PI / 4) % (Math.PI / 2)) + Math.PI / 2) % (Math.PI / 2)) - Math.PI / 4;
 function blockFrames(c, poly) {
@@ -305,8 +244,6 @@ function blockFrames(c, poly) {
     let bd = Infinity;
     clusters.forEach((cl, k) => { const d = Math.abs(wrap90(e.phi - cl.phi)); if (d < bd) { bd = d; e.k = k; } });
   }
-
-  // Island cells -> cluster of the nearest outline edge
   const w = c.i1 - c.i0 + 1, h = c.j1 - c.j0 + 1;
   const owner = new Int8Array(w * h).fill(-1);
   for (let j = 0; j < h; j++) {
@@ -327,31 +264,27 @@ function blockFrames(c, poly) {
       owner[j * w + i] = bk;
     }
   }
-
   const px = R.x0 + ((c.i0 + c.i1 + 1) * RES) / 2;
   const pz = R.z0 + ((c.j0 + c.j1 + 1) * RES) / 2;
-  // Each cluster's frame: the island re-rasterised turned to the cluster's direction, eroded by the sidewalk width
-  // there (`prop`, square runs along u then v) and its own region (`reg`)
   const views = clusters.map((cl, k) => {
-    const th = -cl.phi; // local +x (u) runs along the cluster's edges
+    const th = -cl.phi;
     const cs = Math.cos(th), sn = Math.sin(th);
-    // local bbox of the island's world bbox
     let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
     for (const [x, z] of [[c.i0, c.j0], [c.i1 + 1, c.j0], [c.i0, c.j1 + 1], [c.i1 + 1, c.j1 + 1]]) {
       const dx = R.x0 + x * RES - px, dz = R.z0 + z * RES - pz;
-      const u = px + dx * cs - dz * sn, v = pz + dx * sn + dz * cs; // R_y(-θ)
+      const u = px + dx * cs - dz * sn, v = pz + dx * sn + dz * cs;
       u0 = Math.min(u0, u); u1 = Math.max(u1, u); v0 = Math.min(v0, v); v1 = Math.max(v1, v);
     }
     u0 = Math.floor(u0); v0 = Math.floor(v0);
     const lw = Math.ceil(u1 - u0) + 1, lh = Math.ceil(v1 - v0) + 1;
     const isl = new Uint8Array(lw * lh);
     const reg = new Uint8Array(lw * lh);
-    const cell = new Int32Array(lw * lh).fill(-1); // island cell (index into the block's w x h raster) under each local cell
+    const cell = new Int32Array(lw * lh).fill(-1);
     for (let j = 0; j < lh; j++) {
       const dv = v0 + j + 0.5 - pz;
       for (let i = 0; i < lw; i++) {
         const du = u0 + i + 0.5 - px;
-        const x = px + du * cs + dv * sn, z = pz - du * sn + dv * cs; // R_y(θ)
+        const x = px + du * cs + dv * sn, z = pz - du * sn + dv * cs;
         const gi = Math.floor((x - R.x0) / RES) - c.i0, gj = Math.floor((z - R.z0) / RES) - c.j0;
         if (gi < 0 || gj < 0 || gi >= w || gj >= h) continue;
         const o = owner[gj * w + gi];
@@ -382,9 +315,6 @@ function blockFrames(c, poly) {
     }
     return { th, u0, v0, lw, lh, prop, reg, cell, rects: [] };
   });
-  // Pass 1: each cluster's lots inside its own region. Pass 2: corner wedges & seams no region's lots reached, from
-  // any frame. Island cells under a lot, grown by a cell (the frames sample the raster at different angles), can't be
-  // built on twice.
   const used = new Uint8Array(w * h);
   const markUsed = (k) => {
     const gi = k % w, gj = (k - gi) / w;
@@ -398,7 +328,7 @@ function blockFrames(c, poly) {
       const { lw, lh, prop, reg, cell } = vw;
       const m = new Uint8Array(lw * lh);
       for (let k = 0; k < lw * lh; k++) m[k] = prop[k] && (pass === 2 || reg[k]) && cell[k] >= 0 && !used[cell[k]] ? 1 : 0;
-      const { rects } = maskRects(m, lw, lh, pass === 1 ? 6 : 4, 12);
+      const { rects } = maskRects(m, lw, lh, pass === 1 ? 6 : 4, 10);
       for (const [i0, i1, j0, j1] of rects) {
         for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) if (cell[j * lw + i] >= 0) markUsed(cell[j * lw + i]);
         vw.rects.push([vw.u0 + i0, vw.u0 + i1 + 1, vw.v0 + j0, vw.v0 + j1 + 1]);
@@ -408,6 +338,34 @@ function blockFrames(c, poly) {
   const frames = views.filter((vw) => vw.rects.length).map((vw) => [vw.th, px, pz, vw.rects]);
   return frames.length ? frames : null;
 }
+
+// --- Land-use shares of a component ------------------------------------------------------------------------------------
+function landUseOf(c) {
+  const counts = new Float64Array(16);
+  const names = new Map();
+  let n = 0;
+  for (let j = c.j0; j <= c.j1; j++) {
+    for (let i = c.i0; i <= c.i1; i++) {
+      if (lab[j * W + i] !== c.id) continue;
+      n++;
+      const x = R.x0 + (i + 0.5) * RES, z = R.z0 + (j + 0.5) * RES;
+      const cls = C.at(x, z);
+      counts[cls]++;
+      if (cls) {
+        const id = CI.at(x, z);
+        if (id) names.set(id, (names.get(id) || 0) + 1);
+      }
+    }
+  }
+  let dom = 0;
+  for (let k = 1; k < 16; k++) if (counts[k] > counts[dom]) dom = k;
+  let bestName = '', bestN = 0;
+  for (const [id, m] of names) if (m > bestN) { bestN = m; bestName = landuse[id - 1].name; }
+  const share = (k) => counts[k] / n;
+  const green = share(CLS.PARK) + share(CLS.PLAZA) + share(CLS.GRASS) + share(CLS.CEMETERY);
+  return { cls: dom, clsShare: counts[dom] / n, park: green, parkName: bestN > n * 0.3 ? bestName : '', shares: Array.from(counts, (v) => Math.round((v / n) * 100) / 100) };
+}
+const BUILDABLE = new Set([CLS.NONE, CLS.INDUSTRIAL, CLS.CAMPUS, CLS.PARKING, CLS.GRASS, CLS.SPORTS]);
 
 // --- Assemble blocks ---------------------------------------------------------------------------------------------------
 const blocks = [];
@@ -421,8 +379,10 @@ for (const c of comps) {
   if (ringArea(poly) > 0) poly.reverse();
   const bw = (c.i1 - c.i0 + 1) * RES, bd = (c.j1 - c.j0 + 1) * RES;
   const rectness = area / (bw * bd);
-  const { rects, propArea, covered } = area >= 300 ? lotRects(c) : { rects: [], propArea: 0, covered: 0 };
-  const frames = rectness <= 0.985 && area >= 300 ? blockFrames(c, poly) : null;
+  const lu = landUseOf(c);
+  const buildable = BUILDABLE.has(lu.cls) || lu.clsShare < 0.5;
+  const { rects, propArea, covered } = area >= 200 && buildable && area < 600000 ? lotRects(c) : { rects: [], propArea: 0, covered: 0 };
+  const frames = rectness <= 0.985 && area >= 200 && buildable && area < 150000 && lu.park < 0.6 ? blockFrames(c, poly) : null;
   blocks.push({
     id: blocks.length,
     poly,
@@ -431,10 +391,17 @@ for (const c of comps) {
     rect: rectness > 0.985,
     rects,
     frames,
-    fill: propArea ? Math.round((covered / propArea) * 100) / 100 : 0
+    propArea,
+    fill: propArea ? Math.round((covered / propArea) * 100) / 100 : 0,
+    ...lu,
+    buildings: []
   });
 }
-log(`${blocks.length} blocks (${blocks.filter((b) => b.rect).length} rectangular, ${blocks.filter((b) => !b.rects.length).length} without lots); ${small} specks dropped`);
-log(`${blocks.filter((b) => b.frames).length} irregular blocks with frontage frames (${blocks.reduce((t, b) => t + (b.frames ? b.frames.length : 0), 0)} frames)`);
+log(`${blocks.length} blocks (${blocks.filter((b) => b.rect).length} rectangular, ${blocks.filter((b) => !b.rects.length).length} without lots, ${blocks.filter((b) => b.frames).length} with frontage frames); ${small} specks dropped`);
+{
+  const byCls = {};
+  for (const b of blocks) byCls[b.cls] = (byCls[b.cls] || 0) + 1;
+  log(`blocks by dominant land use: ${JSON.stringify(byCls)}`);
+}
 
-export { blocks, innerRing, roads, R as blockRaster, lab as blockLabels };
+export { blocks, landRing, roads, R as blockRaster, lab as blockLabels, W as rasterW };

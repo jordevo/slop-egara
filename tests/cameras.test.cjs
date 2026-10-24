@@ -40,6 +40,27 @@ function eventTarget() {
   };
 }
 
+// The scenic presets look their vantage points up in the city data at module load: a small Terrassa-shaped stub
+function cityConfigStub() {
+  return {
+    CITY_LANDMARKS: [
+      { id: 'placavella', name: 'Plaça Vella', short: 'Plaça Vella', x: 0, z: 0, site: null },
+      { id: 'catedral', name: 'Catedral Basílica del Sant Esperit', short: 'Catedral', x: 72.8, z: -2.1, site: { w: 68, d: 54 } },
+      { id: 'masiafreixa', name: 'Masia Freixa', short: 'Masia Freixa', x: -529, z: -247, site: { w: 47, d: 27 } },
+      { id: 'cartoixa', name: 'Castell Cartoixa de Vallparadís', short: 'Cartoixa', x: 721.9, z: -126.6, site: { w: 38, d: 43 } },
+      { id: 'mutua', name: 'Hospital Universitari Mútua Terrassa', short: 'Mútua', x: 540.9, z: -80.5, site: { w: 57, d: 40, h: 70 } },
+      { id: 'estadi', name: 'Estadi Olímpic de Terrassa', short: 'Estadi Olímpic', x: 376.7, z: -1523.9, site: { w: 156, d: 187 } },
+      { id: 'vallparadis', name: 'Parc de Vallparadís', short: 'Vallparadís', x: 563.5, z: 319.9, site: { kind: 'park' } }
+    ],
+    LANDMARK_SITES: { 'Estadi Municipal Olímpic': { x: 376.7, z: -1523.9, w: 156, d: 187 } },
+    TELEPORT_LOCATIONS: { rambla: { x: -230, z: -480, heading: Math.PI } },
+    SPAWN: { x: 39.9, z: 71.3, heading: -1.87 },
+    STREET_INDEX: [{ name: 'Rambla d\'Ègara', x: -220, z: -500, minX: -300, maxX: -140, minZ: -1100, maxZ: 100 }],
+    PARKS: [{ name: 'Parc de Sant Jordi', rings: [[{ x: -484, z: -304 }, { x: -623, z: -344 }, { x: -640, z: -150 }, { x: -500, z: -140 }]] }],
+    pointInPoly: () => false
+  };
+}
+
 function cameraHarness(entity = {
   position: new Vector3(0, 0, 100), heading: 0, speed: 0, type: 'car',
   chaseDistance: 6.9, chaseHeight: 2.12, cameraTargetOffset: new Vector3(0, 1, 0)
@@ -59,7 +80,7 @@ function cameraHarness(entity = {
   window.innerHeight = 900;
   const { CameraSystem } = loadModule(source, {
     globals: { window, document },
-    imports: { 'three/webgpu': { Vector3, PerspectiveCamera }, './landmarks.js': {} }
+    imports: { 'three/webgpu': { Vector3, PerspectiveCamera }, './city-config.js': cityConfigStub() }
   });
   const camera = new CameraSystem(canvas, { getActiveEntity: () => entity });
   return {
@@ -181,7 +202,7 @@ test('mouse orbit and wheel zoom retain their behavior and bounds', () => {
   close(h.camera.zoomMultiplier, 2.4);
 });
 
-for (const preset of ['chase', 'observatory', 'drone']) {
+for (const preset of ['chase', 'mutua', 'drone']) {
   test(`teleport after driving, orbiting and ${preset} snaps to a fresh chase view`, () => {
     const h = cameraHarness();
     h.entity.speed = 45;

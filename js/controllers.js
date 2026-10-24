@@ -1,11 +1,11 @@
 import * as THREE from 'three/webgpu';
 import {
   ISLAND_BOUNDS,
-  CENTRAL_PARK_BOUNDS,
   getIslandBoundsAtZ,
   isTypingInField,
   blockAt,
-  streetZ
+  parkAt,
+  SPAWN
 } from './city-config.js';
 import { cityUniforms, createCarPaintMaterial, createContactShadowMaterial } from './tsl-materials.js';
 import {
@@ -20,19 +20,30 @@ import {
   createLoftedHelicopterMaterial
 } from './actor-models.js';
 import { PersonCrowd, PersonRig } from './pedestrians.js';
+import { groundHeightAt } from './city-grid.js';
 import { HEADLIGHTS, createVehicleHeadlight, placeVehicleHeadlight } from './vehicle-lights.js';
-import { bryantParkLawn } from './landmarks.js';
 
 // js/controllers.js
 // Sculpted, non-blocky GTA 6-style 3D models, animations, and physics controllers
 // for Third-Person Navigation:
 // 1. Person (Skinned Pedestrian: planted-footstep IK walk/run/jump, see pedestrians.js)
-// 2. Car (Aerodynamic Sculpted NYC Medallion Yellow Taxi with Sloped Windshield & Clearcoat)
+// 2. Car (Aerodynamic Sculpted Terrassa White Taxi with Sloped Windshield & Clearcoat)
 // 3. Cyclist (Sculpted Road Cyclist with Drop-Bar Frame & Aero Helmet)
-// 4. Helicopter (Manhattan Sightseeing Twin-Turbine Chopper)
+// 4. Helicopter (Twin-Turbine Chopper)
 
-// Spawn on 5th Ave at 37th St, facing south down the avenue toward the Empire State Building (34th St)
-const SPAWN_Z = streetZ(37);
+// Spawn by the Plaça Vella (city-config.js SPAWN: on the nearest street, facing along it). The other modes start a
+// few metres away: the pedestrian on the sidewalk beside the car, the cyclist ahead, the helicopter above & behind.
+const spawnDir = { x: Math.sin(SPAWN.heading), z: Math.cos(SPAWN.heading) }; // heading 0 faces +z
+const spawnRight = { x: spawnDir.z, z: -spawnDir.x };
+const spawnAt = (ahead, right, y = 0) => new THREE.Vector3(SPAWN.x + spawnDir.x * ahead + spawnRight.x * right, y, SPAWN.z + spawnDir.z * ahead + spawnRight.z * right);
+function sidewalkSpawn() {
+  // the first point to the right of the car (then the left) that lies on a curb island
+  for (const side of [1, -1]) for (let d = 2; d <= 9; d += 0.5) {
+    const p = spawnAt(3, side * d);
+    if (blockAt(p.x, p.z)) return p;
+  }
+  return spawnAt(3, 4);
+}
 const groundCollider = { type: 'ground' };
 
 const CAR_DRIVE = {
@@ -128,54 +139,61 @@ function buildingContact(c, x, y, z, body, contact) {
 }
 
 function createTaxiDoorDecalTexture() {
+  // Terrassa's municipal taxi livery: white car, a diagonal red & blue double stripe across the front doors, the
+  // licence number under it (the number is invented: see HOW_TO_IMPROVE.md)
   const c = document.createElement('canvas');
   c.width = 256;
   c.height = 128;
   const ctx = c.getContext('2d');
-  ctx.fillStyle = '#ffbe14';
+  ctx.fillStyle = '#f4f4f1';
   ctx.fillRect(0, 0, 256, 128);
-  // Black T&LC circle emblem
-  ctx.fillStyle = '#111317';
+  ctx.save();
   ctx.beginPath();
-  ctx.arc(58, 64, 42, 0, Math.PI * 2);
+  ctx.moveTo(40, 128); ctx.lineTo(130, 0); ctx.lineTo(166, 0); ctx.lineTo(76, 128); ctx.closePath();
+  ctx.fillStyle = '#c8102e';
   ctx.fill();
-  ctx.fillStyle = '#ffbe14';
-  ctx.font = '900 32px Inter, Arial, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('T', 58, 66);
-  // NYC TAXI typography & Fare Rate
+  ctx.beginPath();
+  ctx.moveTo(84, 128); ctx.lineTo(174, 0); ctx.lineTo(200, 0); ctx.lineTo(110, 128); ctx.closePath();
+  ctx.fillStyle = '#1f4e9c';
+  ctx.fill();
+  ctx.restore();
   ctx.fillStyle = '#111317';
   ctx.textAlign = 'left';
-  ctx.font = '900 26px Inter, Arial, sans-serif';
-  ctx.fillText('NYC TAXI', 112, 42);
-  ctx.font = '700 15px JetBrains Mono, monospace';
-  ctx.fillText('7Y48 · MEDALLION', 112, 68);
-  ctx.font = '600 13px Inter, Arial, sans-serif';
-  ctx.fillText('$3.00 INITIAL FARE', 112, 90);
+  ctx.textBaseline = 'middle';
+  ctx.font = '900 22px Inter, Arial, sans-serif';
+  ctx.fillText('TAXI', 150, 86);
+  ctx.font = '700 13px Inter, Arial, sans-serif';
+  ctx.fillText('TERRASSA · 47', 150, 108);
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
 }
 
-function createNYLicensePlateTexture() {
+function createSpanishPlateTexture() {
+  // Spanish plate: white, black "1234 BCD", blue EU band with the ring of stars and "E" on the left
   const c = document.createElement('canvas');
   c.width = 256;
   c.height = 128;
   const ctx = c.getContext('2d');
-  ctx.fillStyle = '#ffb81c';
+  ctx.fillStyle = '#f7f7f4';
   ctx.fillRect(0, 0, 256, 128);
-  ctx.fillStyle = '#0d2244';
-  ctx.fillRect(6, 6, 244, 24);
-  ctx.fillStyle = '#ffb81c';
-  ctx.font = '800 15px Inter, Arial, sans-serif';
+  ctx.fillStyle = '#003399';
+  ctx.fillRect(0, 0, 36, 128);
+  ctx.fillStyle = '#ffcc00';
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.arc(18 + Math.cos(a) * 11, 40 + Math.sin(a) * 11, 1.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '800 26px Inter, Arial, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('NEW YORK', 128, 23);
-  ctx.fillStyle = '#0d2244';
-  ctx.font = '900 48px JetBrains Mono, monospace';
-  ctx.fillText('7Y48A', 128, 82);
-  ctx.font = '700 13px Inter, Arial, sans-serif';
-  ctx.fillText('NYC T&LC', 128, 114);
+  ctx.textBaseline = 'middle';
+  ctx.fillText('E', 18, 92);
+  ctx.fillStyle = '#111317';
+  ctx.font = '900 54px JetBrains Mono, monospace';
+  ctx.fillText('4821 KTR', 148, 66);
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
@@ -427,7 +445,7 @@ class ThirdPersonControllerManager {
   }
 
   // =========================================================================
-  // 1. PERSON (SKINNED NYC PEDESTRIAN WITH PLANTED-FOOTSTEP IK GAIT, see pedestrians.js)
+  // 1. PERSON (SKINNED PEDESTRIAN WITH PLANTED-FOOTSTEP IK GAIT, see pedestrians.js)
   // =========================================================================
   createPersonEntity() {
     const root = new THREE.Group();
@@ -454,8 +472,8 @@ class ThirdPersonControllerManager {
       mesh: root,
       crowd,
       rig,
-      position: new THREE.Vector3(-11.6, ISLAND_BOUNDS.sidewalkHeight, SPAWN_Z + 12),
-      heading: 0,
+      position: sidewalkSpawn().setY(ISLAND_BOUNDS.sidewalkHeight),
+      heading: SPAWN.heading,
       speed: 0,
       verticalVel: 0,
       cameraTargetOffset: new THREE.Vector3(0, 1.55, 0),
@@ -465,7 +483,7 @@ class ThirdPersonControllerManager {
   }
 
   // =========================================================================
-  // 2. CAR (3D LOFTED SCULPTED NYC MEDALLION YELLOW TAXI SEDAN)
+  // 2. CAR (3D LOFTED SCULPTED TERRASSA WHITE TAXI SEDAN)
   // =========================================================================
   createCarEntity() {
     const root = new THREE.Group();
@@ -475,7 +493,7 @@ class ThirdPersonControllerManager {
     root.add(chassisPivot);
 
     const spec = BODY_SPECS.taxi;
-    const taxiLoftMat = createLoftedCarMaterial(spec, 0xffbe14);
+    const taxiLoftMat = createLoftedCarMaterial(spec, 0xf4f4f1);
 
     // 1. 3D Lofted Taxi Body + Curved Windscreens + Crowned Roof + Side Mirrors + Roof Sign
     const carBodyGeo = buildCarGeometry(spec, false);
@@ -484,7 +502,7 @@ class ThirdPersonControllerManager {
     carBodyMesh.receiveShadow = true;
     chassisPivot.add(carBodyMesh);
 
-    // 2. Authentic NYC Taxi Side Door T&LC Medallion & Fare Tariff Emblem Decals, hugging the curved front doors
+    // 2. Terrassa taxi door livery: the diagonal red & blue stripe with the municipal licence number, hugging the curved front doors
     const doorDecalTex = createTaxiDoorDecalTexture();
     const doorDecalMat = new THREE.MeshStandardNodeMaterial({
       map: doorDecalTex,
@@ -500,8 +518,8 @@ class ThirdPersonControllerManager {
       chassisPivot.add(decal);
     }
 
-    // 3. High-Detail NY Empire Gold License Plates on the bumpers
-    const nyPlateTex = createNYLicensePlateTexture();
+    // 3. Spanish number plates on the bumpers (white, blue EU band)
+    const nyPlateTex = createSpanishPlateTexture();
     const nyPlateMat = new THREE.MeshStandardNodeMaterial({ map: nyPlateTex, roughness: 0.28 });
     const rearPlate = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.14, 0.02), nyPlateMat);
     rearPlate.position.set(0, spec.plates[1], spec.zRear - 0.006);
@@ -556,14 +574,14 @@ class ThirdPersonControllerManager {
 
     return {
       type: 'car',
-      label: 'NYC Yellow Taxi',
+      label: 'Terrassa Taxi',
       mesh: root,
       chassisPivot,
       carState,
       headLights,
       wheels,
-      position: new THREE.Vector3(3.6, 0.0, SPAWN_Z + 12),
-      heading: 0,
+      position: spawnAt(0, 0),
+      heading: SPAWN.heading,
       speed: 0,
       vx: 0,
       vz: 0,
@@ -717,7 +735,7 @@ class ThirdPersonControllerManager {
 
     return {
       type: 'cyclist',
-      label: 'NYC Bike Lane Cyclist',
+      label: 'Cyclist',
       mesh: root,
       leanPivot,
       frontWheel,
@@ -729,8 +747,8 @@ class ThirdPersonControllerManager {
       riderRig,
       helmet,
       headLight,
-      position: new THREE.Vector3(5.2, 0.0, SPAWN_Z - 8),
-      heading: 0,
+      position: spawnAt(12, 0.6),
+      heading: SPAWN.heading,
       speed: 0,
       leanAngle: 0,
       pedalPhase: 0,
@@ -808,13 +826,13 @@ class ThirdPersonControllerManager {
 
     return {
       type: 'helicopter',
-      label: 'Sightseeing Helicopter',
+      label: 'Rescue Helicopter',
       mesh: root,
       tiltPivot,
       mainRotorPivot,
       tailRotorPivot,
-      position: new THREE.Vector3(-110, 96, SPAWN_Z - 60),
-      heading: 0.62,
+      position: spawnAt(-90, -40, 96),
+      heading: SPAWN.heading,
       speed: 0,
       verticalSpeed: 0,
       pitchAngle: 0,
@@ -825,27 +843,19 @@ class ThirdPersonControllerManager {
     };
   }
 
-  // On a raised curb island (city-config.js BLOCKS: the real blocks, malls & plazas), not in a park
+  // On a raised curb island (city-config.js BLOCKS: the real blocks, medians & squares), not on open land (parks,
+  // woods, fields: at ground level)
   isPointOnSidewalk(x, z) {
     const b = blockAt(x, z);
-    return !!b && !(b.park > 0.6 && !b.median);
+    return !!b && !(b.open && !b.median) && !(b.park > 0.6 && !b.median);
   }
 
   getGroundHeight(x, z, mode = 'person') {
-    // Inside Central Park (5th Ave to Central Park West, 59th St to 110th St)
-    const cp = CENTRAL_PARK_BOUNDS;
-    if (x > cp.minX && x < cp.maxX && z > cp.minZ && z < cp.maxZ) {
-      return 1.24;
-    }
-    // Inside Bryant Park's Great Lawn (west of the New York Public Library, 40th-42nd St)
-    const lawn = bryantParkLawn;
-    if (lawn && x > lawn.minX && x < lawn.maxX && z > lawn.minZ && z < lawn.maxZ) {
-      return lawn.top;
-    }
-    if (mode === 'person') {
-      return this.isPointOnSidewalk(x, z) ? ISLAND_BOUNDS.sidewalkHeight : 0.0;
-    }
-    return 0.0;
+    // The ground city-grid.js built: 0 on the roadway, the kerb height on sidewalks, the sunken lawns of the Parc de
+    // Vallparadís and the riera channels below street level (vehicles are kept on the roadway by the colliders)
+    const y = groundHeightAt(x, z);
+    if (mode === 'person') return y;
+    return Math.min(0, y);
   }
 
   // The colliders whose bounds come within `r` of (x, z), in their original order. They never move, so they are
@@ -888,7 +898,7 @@ class ThirdPersonControllerManager {
   }
 
   resolveHorizontalCollision(pos, radius, carEntity = null, entity = carEntity) {
-    // The detailed island (the helicopter may roam out over the harbour & the boroughs)
+    // The detailed area (the helicopter may roam out over the Vallès & the surrounding towns)
     const heli = this.activeMode === 'helicopter';
     const m = heli ? 6000 : 0;
     pos.x = Math.max(ISLAND_BOUNDS.minX - m, Math.min(ISLAND_BOUNDS.maxX + m, pos.x));

@@ -198,6 +198,21 @@ function chainBuffer(context) {
   return normalizeLoop(buffer, 0.16, 0.8);
 }
 
+// Two-tone ("hi-lo") control voltage: a square wave with rounded corners, so the pitch jumps between the two notes
+// with the slight portamento of the real electronic circuits rather than clicking.
+function sirenTwoToneWave(context) {
+  const real = new Float32Array(25), imaginary = new Float32Array(25);
+  for (let harmonic = 1; harmonic < real.length; harmonic++) {
+    for (let i = 0; i < 512; i++) {
+      const phase = i / 512;
+      const square = Math.tanh(Math.sin(2 * Math.PI * phase) * 9) / Math.tanh(9);
+      real[harmonic] += square * Math.cos(2 * Math.PI * harmonic * phase) / 256;
+      imaginary[harmonic] += square * Math.sin(2 * Math.PI * harmonic * phase) / 256;
+    }
+  }
+  return context.createPeriodicWave(real, imaginary);
+}
+
 function sirenSweepWave(context) {
   const real = new Float32Array(25), imaginary = new Float32Array(25);
   // Electronic wail/yelp circuits use a nearly triangular control voltage, with softened turning points.
@@ -285,6 +300,7 @@ export function createSynthResources(context) {
     chain: chainBuffer(context),
     sirenWave: wave([0, 1, 0.13, 0.29, 0.055, 0.11, 0.025, 0.045, 0.012, 0.018]),
     sirenSweep: sirenSweepWave(context),
+    sirenTwoTone: sirenTwoToneWave(context),
     voiceSerial: 0
   };
 }
@@ -302,8 +318,12 @@ function smoothParameter(parameter, timeConstant = 0.07, epsilon = 0.0001, snapI
   };
 }
 
+// Siren voices: 'siren' is the Spanish two-tone (hi-lo) pattern the Policia Municipal and the other emergency services
+// use here (two notes alternating about once a second); 'siren-wail' keeps the American wail/yelp sweep.
+const SIREN_KINDS = ['siren', 'siren-wail'];
+
 export function createMotorVoice(context, resources, kind, output) {
-  if (!['sedan', 'suv', 'bus', 'helicopter', 'cyclist', 'siren'].includes(kind)) {
+  if (!['sedan', 'suv', 'bus', 'helicopter', 'cyclist', ...SIREN_KINDS].includes(kind)) {
     throw new RangeError(`Unknown motor voice: ${kind}`);
   }
   const nodes = [];
@@ -519,7 +539,42 @@ export function createMotorVoice(context, resources, kind, output) {
       chainFrequency((1700 + load * 600) * doppler, now);
       noiseRate((0.9 + Math.min(1, movement) * 0.2) * doppler, now);
     };
+  } else if (kind === 'siren') {
+    // Two-tone: the horn jumps between ~660 and ~880 Hz (a fourth apart, centre 770 Hz) about once a second. The
+    // square control wave (resources.sirenTwoTone) drives the oscillator frequency; the same wave nudges the level
+    // so the upper note sits a touch louder, as it does on the real horns.
+    const siren = oscillator(resources.sirenWave, 770);
+    const highpass = filter('highpass', 380, 0.7);
+    const hornBody = filter('peaking', 1400, 1.0);
+    hornBody.gain.value = 3.5;
+    const hornFilter = filter('lowpass', 3600, 0.65);
+    const sirenGain = gain();
+    siren.connect(highpass).connect(hornBody).connect(hornFilter).connect(sirenGain).connect(mix);
+    const toggle = oscillator(resources.sirenTwoTone, 1.0);
+    const toggleDepth = gain();
+    toggle.connect(toggleDepth).connect(siren.frequency);
+    const envelopeDepth = gain();
+    toggle.connect(envelopeDepth).connect(sirenGain.gain);
+    const sirenFrequency = smoothParameter(siren.frequency, 0.09, 0.1);
+    const toggleFrequency = smoothParameter(toggle.frequency, 0.035, 0.002, true);
+    const toggleRange = smoothParameter(toggleDepth.gain, 0.09, 0.1);
+    const sirenLevel = smoothParameter(sirenGain.gain, 0.10);
+    const envelopeLevel = smoothParameter(envelopeDepth.gain, 0.10);
+    const sirenCutoff = smoothParameter(hornFilter.frequency, 0.12, 1);
+    const hornFrequency = smoothParameter(hornBody.frequency, 0.12, 1);
+    render = (speed, load, doppler, now) => {
+      const pitch = (0.98 + variation * 0.04) * doppler;
+      sirenFrequency(770 * pitch, now);
+      toggleRange(110 * pitch, now);
+      // Each car alternates at its own cadence (0.9-1.1 Hz); Doppler shifts the pitch and the cadence alike
+      toggleFrequency((0.9 + variation * 0.2) * doppler, now);
+      sirenLevel(0.09, now);
+      envelopeLevel(0.012, now);
+      sirenCutoff(3600 * doppler, now);
+      hornFrequency(1400 * doppler, now);
+    };
   } else {
+    // American wail / yelp sweep (kept as 'siren-wail')
     const siren = oscillator(resources.sirenWave, 1125);
     const highpass = filter('highpass', 480, 0.7);
     const hornBody = filter('peaking', 1750, 1.1);
