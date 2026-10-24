@@ -4,7 +4,7 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { SIGNAL_TIMING, blockAt, STREET_TREES, nearestRoads, prettyName, UNNAMED, LAND_CLASS, WORLD_BOUNDS, blockProfile } from './city-config.js';
 import { cityUniforms, createTreeGrateMaterial } from './tsl-materials.js';
 import { createTreeField } from './trees.js';
-import { pavedPlazaRects, parkTreeSites, sidewalkBlocks, parkLampSites } from './city-grid.js';
+import { pavedPlazaRects, parkTreeSites, sidewalkBlocks, parkLampSites, groundHeightAt } from './city-grid.js';
 import { GEO } from './terrassa-geodata.js';
 
 // js/street-details.js
@@ -14,8 +14,11 @@ import { GEO } from './terrassa-geodata.js';
 //   clock & SIGNAL_TIMING that js/traffic.js obeys: the widest road at each junction runs on the main phase (group 0)
 // - Red / green man pedestrian signals at the signalled crossings (OSM), litter bins & bollards
 // - Catalan street name plaques (white plaque, blue lettering, the full name: "Carrer de Sant Pere") on the building
-//   corner where two named streets meet
+//   corner where two named streets meet; where no building stands at the corner (an empty lot, a car park, an open
+//   block) the plates hang on a slim dark-blue pole at the kerb corner instead, as the city does at open corners
 // - Column luminaires along every kerb (wall-mounted lanterns in the old town's lanes), lamps on the medians
+// Everything "on a facade" (plaques, wall lanterns) is only mounted where a facade exists: the building colliders
+// (js/buildings.js, js/landmarks.js) passed in through opts.colliders are hashed and probed behind each mount point
 // - Street trees: the 834 mapped trees (OSM) plus rows of planes, limes & small ornamentals in tree pits along the
 //   wider streets, the planted medians of the avenues & the Rambla d'Ègara, and the park, square & wood trees laid
 //   out by city-grid.js
@@ -181,7 +184,15 @@ function createPedSignalMaterial(isAvenue, clock) {
   return mat;
 }
 
-function buildStreetDetails(scene) {
+/**
+ * @param {THREE.Scene} scene
+ * @param {{ colliders?: Array<{minX, maxX, minZ, maxZ, minY?, maxY, obb?: {cx, cz, hx, hz, cs, sn}}> }} [opts]
+ *   colliders: the building / landmark colliders (world AABB, optionally an oriented box inside it) that stand for
+ *   the facades. Plaques and wall lanterns are only hung where one of them is right behind the mount point; without
+ *   the option (undefined) every assumed facade is trusted, as before, and an empty array means "no walls anywhere".
+ * @returns {{ group, footprints, signalClock, audioSignals, update, stats }}
+ */
+function buildStreetDetails(scene, opts = {}) {
   const group = new THREE.Group();
   group.name = 'TerrassaStreetDetails';
 
@@ -261,9 +272,15 @@ function buildStreetDetails(scene) {
     new THREE.ConeGeometry(0.24, 0.18, 4).rotateY(Math.PI / 4).translate(0, 4.64, 0.72)
   ].map((g) => g.toNonIndexed()));
   const wallLanternGeo = new THREE.BoxGeometry(0.22, 0.34, 0.22).translate(0, 4.4, 0.72);
-  // Plaque: enamel face & blue frame
+  // Plaque: enamel face & blue frame; and the slim 2.6 m pole (origin at its foot) the plates hang on at open corners
   const plaqueFaceGeo = new THREE.PlaneGeometry(0.6, 0.3).translate(0, 0, 0.017);
   const plaqueFrameGeo = new THREE.BoxGeometry(0.64, 0.34, 0.03);
+  const PLAQUE_POLE_H = 2.6;
+  const plaquePoleGeo = mergeGeometries([
+    new THREE.CylinderGeometry(0.03, 0.035, PLAQUE_POLE_H, 8).translate(0, PLAQUE_POLE_H / 2, 0),
+    new THREE.CylinderGeometry(0.04, 0.04, 0.03, 8).translate(0, PLAQUE_POLE_H + 0.015, 0),
+    new THREE.CylinderGeometry(0.07, 0.08, 0.12, 8).translate(0, 0.06, 0)
+  ].map((g) => g.toNonIndexed()));
   // Litter bin & bollard
   const binGeo = mergeGeometries([
     new THREE.CylinderGeometry(0.2, 0.18, 0.8, 10).translate(0, 0.4, 0),
@@ -277,7 +294,7 @@ function buildStreetDetails(scene) {
   // ---- Instance accumulators -----------------------------------------------------------------------------------------
   const M = {
     signalPole: [], signalArm: [], head: [], mainLens: [], crossLens: [], pedPole: [], pedHead: [], pedMainLens: [], pedCrossLens: [],
-    column: [], columnArm: [], post: [], wall: [], plaque: [], bin: [], bollard: []
+    column: [], columnArm: [], post: [], wall: [], plaque: [], plaquePole: [], bin: [], bollard: []
   };
   const plaqueCells = []; // [u0, v0] per plaque, parallel to M.plaque
   const plaqueAtlasOf = []; // atlas index per plaque
@@ -350,6 +367,91 @@ function buildStreetDetails(scene) {
     const s = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453;
     return s - Math.floor(s);
   }
+  // Where the ground is under a pole: the sidewalk top on an island (the walks of the sunken rieres included), 0 on
+  // the roadway (city-grid.js)
+  const groundY = (x, z) => groundHeightAt(x, z);
+
+  // ---- The facades: a spatial hash of the building colliders --------------------------------------------------------
+  // Everything hung "on a facade" (the street plaques, the old town's wall lanterns) is only mounted where one of the
+  // colliders passed in stands right behind the mount point. Plinths & low walls (under 2.5 m) don't count: nothing
+  // hangs at 2.8 m on them.
+  const WALL_MIN_HEIGHT = 2.5;
+  const WALL_CELL = 24;
+  const wallColliders = opts.colliders;
+  const wallGrid = new Map();
+  const wallKey = (ix, iz) => ix * 100003 + iz;
+  if (wallColliders) {
+    for (const c of wallColliders) {
+      if (!(c.maxY >= WALL_MIN_HEIGHT)) continue;
+      const ix0 = Math.floor(c.minX / WALL_CELL), ix1 = Math.floor(c.maxX / WALL_CELL);
+      const iz0 = Math.floor(c.minZ / WALL_CELL), iz1 = Math.floor(c.maxZ / WALL_CELL);
+      for (let i = ix0; i <= ix1; i++) {
+        for (let j = iz0; j <= iz1; j++) {
+          const k = wallKey(i, j);
+          let list = wallGrid.get(k);
+          if (!list) wallGrid.set(k, (list = []));
+          list.push(c);
+        }
+      }
+    }
+  }
+  // Distance from (x, z) to a collider's footprint is within r: the AABB first, then the oriented box, with the point
+  // in the box's frame (js/buildings.js toWorld: world = centre + R · local, R = [[cs, sn], [-sn, cs]])
+  const colliderWithin = (c, x, z, r) => {
+    if (x < c.minX - r || x > c.maxX + r || z < c.minZ - r || z > c.maxZ + r) return false;
+    let ex, ez;
+    if (c.obb) {
+      const o = c.obb;
+      const dx = x - o.cx, dz = z - o.cz;
+      const lx = dx * o.cs - dz * o.sn, lz = dx * o.sn + dz * o.cs;
+      ex = Math.abs(lx) - o.hx;
+      ez = Math.abs(lz) - o.hz;
+    } else {
+      ex = Math.max(c.minX - x, x - c.maxX);
+      ez = Math.max(c.minZ - z, z - c.maxZ);
+    }
+    if (ex <= 0 && ez <= 0) return true;
+    ex = Math.max(ex, 0);
+    ez = Math.max(ez, 0);
+    return ex * ex + ez * ez <= r * r;
+  };
+  // Some building's footprint comes within r metres of (x, z). Without colliders (opts.colliders undefined) every
+  // assumed facade is trusted
+  const wallNear = (x, z, r) => {
+    if (!wallColliders) return true;
+    const ix0 = Math.floor((x - r) / WALL_CELL), ix1 = Math.floor((x + r) / WALL_CELL);
+    const iz0 = Math.floor((z - r) / WALL_CELL), iz1 = Math.floor((z + r) / WALL_CELL);
+    for (let i = ix0; i <= ix1; i++) {
+      for (let j = iz0; j <= iz1; j++) {
+        const list = wallGrid.get(wallKey(i, j));
+        if (!list) continue;
+        for (let k = 0; k < list.length; k++) if (colliderWithin(list[k], x, z, r)) return true;
+      }
+    }
+    return false;
+  };
+  // The facade behind a mount point: (x, z) is meant to sit just outside a wall whose outward normal is (nx, nz).
+  // Marches along -n up to maxIn metres looking for the wall (or along +n up to maxOut when the point is already
+  // inside the building) and returns the point just outside the wall face, or null when there is no wall there.
+  // Without colliders the point is returned as it is.
+  const WALL_STEP = 0.1;
+  const snapToWall = (x, z, nx, nz, maxIn, maxOut) => {
+    if (!wallColliders) return [x, z];
+    if (wallNear(x, z, 0)) {
+      for (let t = WALL_STEP; t <= maxOut + 1e-6; t += WALL_STEP) {
+        const px = x + nx * t, pz = z + nz * t;
+        if (!wallNear(px, pz, 0)) return [px, pz];
+      }
+      return null;
+    }
+    let ox = x, oz = z;
+    for (let t = WALL_STEP; t <= maxIn + 1e-6; t += WALL_STEP) {
+      const px = x - nx * t, pz = z - nz * t;
+      if (wallNear(px, pz, 0)) return [ox, oz];
+      ox = px; oz = pz;
+    }
+    return null;
+  };
 
   // =========================================================================
   // 1. THE STREET GRAPH: the arms of every junction (direction, width, name, which way traffic runs) and, at each,
@@ -521,19 +623,25 @@ function buildStreetDetails(scene) {
   // =========================================================================
   // 4. STREET NAME PLAQUES on the building corner of every corner where two named streets meet: for each pair of
   //    neighbouring arms, the kerb corner lies along their bisector, the building corner 2.4 m (the sidewalk) behind
-  //    it; one plaque per street on the facade facing that street, at 2.8 m
+  //    it; one plaque per street on the facade facing that street, at 2.8 m. The facade has to be there (a building
+  //    collider right behind the plaque): otherwise the plaque slides along the facade line up to 6 m from the corner
+  //    to the first wall, and where the corner has no building at all (an empty lot, a car park, a block whose
+  //    buildings were skipped) both plates hang on a slim pole at the kerb corner instead
   // =========================================================================
   const atlas = new PlaqueAtlas();
   const plaqueKeys = new Set();
   const SIDEWALK = 2.4;
-  function addPlaque(name, x, z, yaw) {
+  const PLAQUE_Y = 2.65; // above the sidewalk
+  let plaquesOnWalls = 0, plaquesOnPoles = 0, plaquePoles = 0, plaquesSkipped = 0;
+  function addPlaque(name, x, y, z, yaw) {
     const key = `${name}|${Math.round(x / 2)}|${Math.round(z / 2)}`;
-    if (plaqueKeys.has(key)) return;
+    if (plaqueKeys.has(key)) return false;
     plaqueKeys.add(key);
     const cell = atlas.cell(name);
-    pushMatrix(M.plaque, x, 2.8, z, yaw);
+    pushMatrix(M.plaque, x, y, z, yaw);
     plaqueCells.push(cell.u0, cell.v0);
     plaqueAtlasOf.push(cell.atlas);
+    return true;
   }
   for (let n = 0; n < nodeCount; n++) {
     const list = arms[n];
@@ -562,15 +670,44 @@ function buildStreetDetails(scene) {
       const back = Math.min(7, SIDEWALK / Math.max(0.35, Math.sin(sector * 0.5)));
       let cxp = nx + bx * (d + back), czp = nz + bz * (d + back);
       if (blockAt(cxp, czp) !== blk) { cxp = nx + bx * (d + 1.2); czp = nz + bz * (d + 1.2); }
+      const wallY = SW_TOP + PLAQUE_Y;
+      const unmounted = []; // the streets whose facade isn't there: { name, fnx, fnz }
       for (const [arm, other] of [[A.a, B.a], [B.a, A.a]]) {
         const px0 = -arm.uz, pz0 = arm.ux;
         const sgn = px0 * other.ux + pz0 * other.uz > 0 ? -1 : 1; // facade normal: away from the block, toward this street
         const fnx = px0 * sgn, fnz = pz0 * sgn;
-        const x = cxp + arm.ux * 1.7 + fnx * 0.08;
-        const z = czp + arm.uz * 1.7 + fnz * 0.08;
-        if (blockAt(x - fnx * 0.5, z - fnz * 0.5) !== blk) continue; // the facade would be over the road
-        addPlaque(arm.name, x, z, Math.atan2(fnx, fnz));
+        const yaw = Math.atan2(fnx, fnz);
+        // the assumed building corner first, then along the facade line away from the corner, to the first wall
+        let mounted = false;
+        for (const along of [1.7, 2.6, 3.6, 4.8, 6.0]) {
+          const x = cxp + arm.ux * along + fnx * 0.08;
+          const z = czp + arm.uz * along + fnz * 0.08;
+          if (blockAt(x - fnx * 0.5, z - fnz * 0.5) !== blk) continue; // the facade would be over the road
+          // the wall within 1.6 m behind the point (or, when a building reaches out over the sidewalk, its face in
+          // front of it), and that face still on the island
+          const face = snapToWall(x, z, fnx, fnz, 1.6, SIDEWALK);
+          if (!face || blockAt(face[0], face[1]) !== blk) continue;
+          if (addPlaque(arm.name, face[0] + fnx * 0.06, wallY, face[1] + fnz * 0.06, yaw)) plaquesOnWalls++;
+          mounted = true;
+          break;
+        }
+        if (!mounted) unmounted.push({ name: arm.name, fnx, fnz });
       }
+      if (!unmounted.length) continue;
+      // No facade at this corner: the plates hang (stacked) on a slim pole 0.4 m inside the kerb corner
+      const kx = nx + bx * (d + 0.4), kz = nz + bz * (d + 0.4);
+      if (!isOnCurbIsland(kx, kz, 0.25) || !isClearOfPoles(kx, kz, 1.0)) { plaquesSkipped += unmounted.length; continue; }
+      const baseY = groundY(kx, kz);
+      let hung = 0;
+      for (const u of unmounted) {
+        if (addPlaque(u.name, kx + u.fnx * 0.045, baseY + PLAQUE_POLE_H - 0.2 - hung * 0.38, kz + u.fnz * 0.045, Math.atan2(u.fnx, u.fnz))) hung++;
+      }
+      if (!hung) continue;
+      placePole(kx, kz);
+      addFootprint(kx, kz, 0.2, 0.2);
+      pushMatrix(M.plaquePole, kx, baseY, kz, 0);
+      plaquePoles++;
+      plaquesOnPoles += hung;
     }
   }
 
@@ -598,7 +735,7 @@ function buildStreetDetails(scene) {
     return true;
   }
   const WIDE_KIND = { oldtown: 1, eixample: 1, blocs: 1, suburban: 1 };
-  let columns = 0, posts = 0, lanterns = 0, rowTrees = 0;
+  let columns = 0, posts = 0, lanterns = 0, lanternsToPosts = 0, lanternsSkipped = 0, rowTrees = 0;
   for (const s of sidewalkBlocks || []) {
     const b = s.block;
     const poly = s.poly;
@@ -640,20 +777,34 @@ function buildStreetDetails(scene) {
       for (let t = start; t < len - 4; t += spacing) {
         const cx = p0.x + ux * t;
         const cz = p0.z + uz * t;
-        if (lampType === 'wall') {
-          // on the facade (the property line, 2.4 m behind the kerb), hanging out over the lane
+        let type = lampType;
+        if (type === 'wall') {
+          // on the facade (the property line, 2.4 m behind the kerb), hanging out over the lane: only where a
+          // building stands within a metre behind that point (or reaches out over the sidewalk up to it); where the
+          // lane has no facade there (an empty lot, a car park, a yard wall) a post at the kerb takes over
           const lx = cx + inx * SIDEWALK, lz = cz + inz * SIDEWALK;
-          if (blockAt(lx, lz) !== b || !isClearOfPoles(lx, lz, 5)) continue;
-          placePole(lx, lz);
-          pushMatrix(M.wall, lx, SW_TOP, lz, Math.atan2(outX, outZ));
-          pointSites.push({ x: lx + outX * 0.72, y: SW_TOP + 4.3, z: lz + outZ * 0.72, color: 0xffd9a0, intensity: 22, dist: 12 });
-          lanterns++;
-        } else {
+          const face = blockAt(lx, lz) === b && wallNear(lx, lz, 1.0) ? snapToWall(lx, lz, outX, outZ, 1.0, SIDEWALK - 0.6) : null;
+          if (face && blockAt(face[0], face[1]) === b) {
+            const [fx, fz] = face;
+            if (!isClearOfPoles(fx, fz, 5)) continue;
+            placePole(fx, fz);
+            pushMatrix(M.wall, fx, SW_TOP, fz, Math.atan2(outX, outZ));
+            pointSites.push({ x: fx + outX * 0.72, y: SW_TOP + 4.3, z: fz + outZ * 0.72, color: 0xffd9a0, intensity: 22, dist: 12 });
+            lanterns++;
+            continue;
+          }
+          type = 'post';
+          lanternsToPosts++;
+        }
+        {
           const lx = cx + inx * 0.65, lz = cz + inz * 0.65;
-          if (!isOnSidewalk(lx, lz, 0.4) || !isClearOfPoles(lx, lz, spacing * 0.35)) continue;
+          if (!isOnSidewalk(lx, lz, 0.4) || !isClearOfPoles(lx, lz, spacing * 0.35)) {
+            if (lampType === 'wall') { lanternsToPosts--; lanternsSkipped++; }
+            continue;
+          }
           placePole(lx, lz);
           addFootprint(lx, lz, 0.4, 0.4);
-          if (lampType === 'column') {
+          if (type === 'column') {
             const yaw = Math.atan2(outZ, -outX) + Math.PI; // the arm's +x toward the roadway
             pushMatrix(M.column, lx, SW_TOP, lz, 0);
             pushMatrix(M.columnArm, lx, SW_TOP, lz, Math.atan2(-outZ, outX));
@@ -841,6 +992,7 @@ function buildStreetDetails(scene) {
     addMatrixArrayInstanced(plaqueFaceGeo, createPlaqueMaterial(tex), idx.map((i) => M.plaque[i]), false, { aPlaqueCell: cells });
   });
   addMatrixArrayInstanced(plaqueFrameGeo, plaqueFrameMat, M.plaque);
+  addMatrixArrayInstanced(plaquePoleGeo, plaqueFrameMat, M.plaquePole);
 
   // Tree pits (granite surround & dark soil, cast-iron grates on the avenues), running along the kerb
   const grateMat = createTreeGrateMaterial();
@@ -886,7 +1038,14 @@ function buildStreetDetails(scene) {
     group.add(pitGrateInst);
   }
 
-  console.info(`[streetDetails] ${signalHeads} signal heads, ${pedHeads} pedestrian signals, ${M.plaque.length} street plaques (${atlas.cells.size} names, ${plaqueTextures.length} atlases), ${columns} columns, ${posts} posts, ${lanterns} wall lanterns, ${M.bollard.length} bollards, ${M.bin.length} bins, ${treePositions.length} trees (${rowTrees} in rows, ${realTrees} mapped)`);
+  const stats = {
+    signalHeads, pedHeads,
+    plaques: M.plaque.length, plaquesOnWalls, plaquesOnPoles, plaquePoles, plaquesSkipped,
+    columns, posts, lanterns, lanternsToPosts, lanternsSkipped,
+    bollards: M.bollard.length, bins: M.bin.length, trees: treePositions.length, rowTrees, realTrees,
+    wallsKnown: !!wallColliders
+  };
+  console.info(`[streetDetails] ${signalHeads} signal heads, ${pedHeads} pedestrian signals, ${M.plaque.length} street plaques (${plaquesOnWalls} on facades, ${plaquesOnPoles} on ${plaquePoles} poles, ${plaquesSkipped} without a corner to stand on; ${atlas.cells.size} names, ${plaqueTextures.length} atlases), ${columns} columns, ${posts} posts (${lanternsToPosts} in place of lanterns with no facade, ${lanternsSkipped} lanterns dropped), ${lanterns} wall lanterns, ${M.bollard.length} bollards, ${M.bin.length} bins, ${treePositions.length} trees (${rowTrees} in rows, ${realTrees} mapped)${wallColliders ? '' : ' [no colliders given: every assumed facade trusted]'}`);
 
   // Procedural trees (js/trees.js): species skeletons with leaf-spray cards, one instanced mesh per species, variant &
   // level of detail, each tree's level following the camera
@@ -1047,7 +1206,7 @@ function buildStreetDetails(scene) {
   }
 
   scene.add(group);
-  return { group, footprints, signalClock, audioSignals, update };
+  return { group, footprints, signalClock, audioSignals, update, stats };
 }
 
 export { buildStreetDetails };

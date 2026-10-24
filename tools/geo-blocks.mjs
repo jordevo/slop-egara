@@ -385,6 +385,7 @@ for (const c of comps) {
   const frames = rectness <= 0.985 && area >= 200 && buildable && area < 150000 && lu.park < 0.6 ? blockFrames(c, poly) : null;
   blocks.push({
     id: blocks.length,
+    label: c.id, // its component id in the label raster (geo-buildings.mjs)
     poly,
     area: Math.round(area),
     bbox: [R.x0 + c.i0 * RES, R.x0 + (c.i1 + 1) * RES, R.z0 + c.j0 * RES, R.z0 + (c.j1 + 1) * RES],

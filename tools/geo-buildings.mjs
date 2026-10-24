@@ -40,23 +40,8 @@ const labelAt = (x, z) => {
   const i = Math.floor((x - blockRaster.x0) / blockRaster.res), j = Math.floor((z - blockRaster.z0) / blockRaster.res);
   return i >= 0 && j >= 0 && i < blockRaster.w && j < blockRaster.h ? blockLabels[j * W + i] : 0;
 };
-// raster label -> block (specks were dropped, so look each block up by a cell inside it)
-const blockById = new Map();
-for (const b of blocks) {
-  const [cx, cz] = centroid(b.poly);
-  let id = labelAt(cx, cz);
-  if (!id) for (const [x0, x1, z0, z1] of b.rects) { id = labelAt((x0 + x1) / 2, (z0 + z1) / 2); if (id) break; }
-  if (!id) {
-    for (let i = 0; i < b.poly.length && !id; i++) {
-      const p = b.poly[i], q = b.poly[(i + 1) % b.poly.length];
-      const mx = (p[0] + q[0]) / 2, mz = (p[1] + q[1]) / 2;
-      const nx = -(q[1] - p[1]), nz = q[0] - p[0];
-      const L = Math.hypot(nx, nz) || 1;
-      id = labelAt(mx + (nx / L) * 0.7, mz + (nz / L) * 0.7) || labelAt(mx - (nx / L) * 0.7, mz - (nz / L) * 0.7);
-    }
-  }
-  if (id && !blockById.has(id)) blockById.set(id, b);
-}
+// raster label -> block (each block keeps its component id)
+const blockById = new Map(blocks.map((b) => [b.label, b]));
 
 // Dominant wall direction (length-weighted, mod 90°) of a set of rings -> the frame angle θ (world = c + R_y(θ)·local)
 function frameAngle(rings) {
@@ -97,7 +82,16 @@ function blockOf(cx, cz, th, rects) {
   }
   let best = 0, bestW = 0;
   for (const [id, w] of votes) if (w > bestW) { bestW = w; best = id; }
-  return blockById.get(best) || null;
+  if (blockById.has(best)) return blockById.get(best);
+  // Standing on the roadway / sidewalk raster (a footprint over a passage, a building the street model cuts through):
+  // the nearest labelled cell within 12 m of the centroid
+  for (let r = 1; r <= 12; r++) {
+    for (let a = 0; a < 16; a++) {
+      const id = labelAt(cx + r * Math.cos((a / 16) * Math.PI * 2), cz + r * Math.sin((a / 16) * Math.PI * 2));
+      if (id && blockById.has(id)) return blockById.get(id);
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

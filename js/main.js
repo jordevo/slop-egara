@@ -84,7 +84,8 @@ async function initApp() {
   markInit('blocks');
   const allColliders = [...landmarkColliders, ...cityBlocks.colliders, ...surroundings.colliders, ...(cityGrid.colliders || [])];
 
-  const streetDetails = buildStreetDetails(scene);
+  // The building colliders tell the street furniture where the facades really are (plaques, wall lanterns)
+  const streetDetails = buildStreetDetails(scene, { colliders: allColliders });
   markInit('streetDetails');
   // Buildings turned along non-grid streets have oriented colliders whose world bounds reach past their lots: they stay
   // inside the property line anyway, so the road network (lanes & sidewalks) doesn't need them.

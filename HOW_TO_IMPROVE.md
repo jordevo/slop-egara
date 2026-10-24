@@ -200,6 +200,14 @@ Hospital Mútua (17 plantas, 70 m), Estadi Olímpic, estaciones, chimeneas indus
 3. `buildings.js` consume el nuevo esquema (plantas por volumen, época de fachada, rótulos reales de 547 comercios,
    procedural solo en 207 manzanas vacías). 107 tests en verde. Masia Freixa: pendiente de fotos de referencia.
 4. Validado en el navegador por el propietario ("me encanta como va mejorando"). Segundo push a `slop-egara`.
+5. Incidencia: edificios reales sin renderizar (p. ej. la comisaria de la Policia Municipal, Avinguda de les Glòries
+   Catalanes) y placas de calle / farolas de pared flotando donde no hay fachada. Causa 1: la tabla etiqueta de
+   ráster → manzana de `geo-buildings.mjs` se construía muestreando el centroide de cada manzana y fallaba en las
+   cóncavas, dejando 507 edificios "sin manzana" dentro del área urbana; ahora cada manzana guarda su etiqueta de
+   componente (`label`) y, si un edificio cae sobre calzada, se busca la manzana más cercana a 12 m. Resultado: 24.037
+   edificios colocados (+285), la comisaria incluida. Causa 2: `street-details.js` montaba placas y fanales "en la
+   fachada" sin comprobar que hubiera una; ahora recibe los colisionadores de los edificios y solo monta en pared
+   real (placa en poste en las esquinas sin edificio).
 
 **Próximos pasos propuestos** (por impacto): (a) alturas reales por volumen con el LiDAR del ICGC; (b) relieve real
 (MDE 5 m) para la ciudad y el entorno, con puentes y túneles a su cota; (c) Masia Freixa y resto de monumentos con
@@ -382,7 +390,8 @@ Pendiente general: todas las alturas 🟠 pueden sustituirse por el modelo 3D de
 | Torrents (135 km) | trazado ✅ / cauce 🔴 | Franja plana de tierra y lodo; tramos bajo calle omitidos |
 | Semáforos (236 cruces) | nodo ✅ / poste 🟡 / aspecto y fases 🔴 | Poste en la esquina derecha de cada acceso, 430 cabezas, báculo en calzadas ≥ 11 m; ciclo único de 60 s. Mejora: inventario de semáforos y planes de fases del Ajuntament |
 | Semáforos peatonales | pasos ✅ / colocación 🟡 | 797 cabezas en los 571 pasos semaforizados de OSM; fase deducida de la vía principal del cruce |
-| Placas de calle | nombres ✅ / posición 🟡 / diseño 🟠 | Esquina del edificio = esquina de bordillo + 2,4 m por la bisectriz; placa crema con texto azul sin escudo; 12.017 placas en 2.867 cruces |
+| Placas de calle | nombres ✅ / posición 🟡 / diseño 🟠 | Solo sobre fachada real (se comprueba contra los colisionadores de los edificios y la placa se desliza hasta 6 m por la fachada hasta encontrar pared): 4.803 en fachada; en esquinas sin edificio (solares, aparcamientos, bloques abiertos) las dos placas cuelgan de un poste azul de 2,6 m a 0,4 m del bordillo 🟠 (7.004 en 4.092 postes); ninguna en parques y campos |
+| Farolas de pared | posición 🔴 / montaje 🟡 | Solo con muro ≥ 2,5 m a menos de 1 m detrás (1.053); si no, báculo de 4,6 m en el bordillo (3.161 convertidas) o nada si no hay acera |
 | Farolas | posición 🔴 / tipología 🟠 | Columna de 8 m cada 28 m (calzada ≥ 8 m), báculo de 4,6 m cada 24 m, fanal de pared cada 20 m en casco antiguo y peatonales. Mejora: inventario de alumbrado público (opendata.terrassa.cat) |
 | Árboles viarios | 834 ✅ (753 colocados) / alineaciones 🔴 | Plátanos cada 7–8 m en calles ≥ 9 m, ornamentales en el 30 % de calles residenciales. Mejora: inventari d'arbrat viari del Ajuntament |
 | Papeleras, bolardos, bancos | 🔴 | Papelera junto a semáforos y 30 % de farolas; bolardos cada 2,5 m en peatonales; bancos tipo Neobarcino en parques y plazas |
