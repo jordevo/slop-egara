@@ -89,6 +89,15 @@ done
 GEO_DATA=tools/data/terrassa node --max-old-space-size=8192 tools/build-geodata.mjs
 ```
 
+Catastro (los GML originales, 380 MB, **no están en el repositorio**; sí el `catastro.json` convertido). Para
+regenerarlo: descargar `https://www.catastro.hacienda.gob.es/INSPIRE/Buildings/08/08279-TERRASSA/A.ES.SDGC.BU.08279.zip`
+(el servidor falla con `curl` por la cadena de certificados en macOS; `python3 -c "import urllib.request..."` funciona),
+descomprimirlo en `tools/data/catastro/` y ejecutar:
+
+```bash
+python3 -I tools/catastro-to-json.py tools/data/catastro tools/data/terrassa/catastro.json
+```
+
 ---
 
 ## 2. Pipeline de datos (`tools/`)
