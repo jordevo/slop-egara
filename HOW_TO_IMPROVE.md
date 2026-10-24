@@ -60,6 +60,8 @@ NYC tenía datos municipales abiertos (DCP, CSCL, NYC Parks). Para Terrassa se u
 | `osm_landuse.json` | 1.936 polígonos de uso del suelo, 834 árboles, 211 tramos de rieras/torrents, 44 tramos de vía férrea | 5,6 MB | 93 parques, 84 jardines, 15 plazas con nombre |
 | `osm_landmarks.json` | 457 elementos con nombre; 51 nodos de barrio (`place=neighbourhood`), 17 plazas | 0,6 MB | 340 monumentos/edificios singulares tras filtrar estatuas y placas |
 | `osm_region.json` | Autopistas, carreteras, ferrocarriles, polígonos de asentamiento, 20 poblaciones y 220 cimas a <16 km | 7,4 MB | Para el horizonte de bajo detalle |
+| `osm_shops.json` | 868 comercios y servicios (766 con nombre): restaurantes, supermercados, farmacias, bancos, peluquerías… | 0,3 MB | Rótulos reales. La cobertura de OSM es parcial (Terrassa tiene miles de comercios) |
+| `catastro.json` (de `tools/data/catastro/`, Catastro INSPIRE *Buildings* 08279) | **25.880 edificios y 101.848 partes** con plantas sobre rasante, uso (residencial 22.808, industrial 1.654, comercial 553, equipamientos 385, oficinas 173, agrario 209), año de construcción y nº de viviendas | 23 MB (GML original 380 MB) | Descargado el 2026-10-24 con permiso. Licencia: reutilización libre con atribución a la Dirección General del Catastro. Conversión UTM 31N → WGS84 en `tools/catastro-to-json.py` (error comprobado contra OSM: 0,1–5,7 m en los centroides de 5 monumentos) |
 
 **Cómo mejorar los datos:**
 
@@ -141,14 +143,25 @@ que queda entre calzadas son las **islas de bordillo** (manzanas). Se les calcul
 - ✅ 834 árboles individuales (`natural=tree`). 🔴 El resto del arbolado de alineación se genera procedimentalmente.
 - ✅ Vías férreas a cielo abierto (Renfe R4 y FGC donde no van soterradas).
 
-### 2.5 Edificios (`geo-buildings.mjs`) — ⚪ en construcción
+### 2.5 Edificios (`geo-buildings.mjs`) — ✅ Catastro + OSM
 
-Plan (ver §4.5 para la parte en tiempo de ejecución):
+Fuente principal desde la sesión 2: **Catastro INSPIRE Buildings**. Resultado: 23.752 edificios colocados en 1.543
+manzanas (1.175 con cobertura ≥ 40 %), 110.265 cajas; 1.876 edificios quedan fuera de la caja de detalle o sobre
+calzada (el término municipal es mucho mayor que el área urbana), 197 ruinas descartadas. OSM solo aporta 1.711
+huellas en manzanas donde el Catastro no tiene nada.
 
-1. ✅ Cada huella OSM se descompone en cajas alineadas a su propia orientación dominante (como las *frontage frames*),
-   con error ≤ 0,25 m, porque el motor de fachadas del original trabaja con cajas instanciadas.
-2. 🟠 Altura: `height` > `building:levels × 3,2 m` > **perfil del barrio** (tabla en `city-config.js`, ver §3.3).
-3. 🔴 Manzanas sin huellas (o con cobertura < 40 % del solar): generador procedural con tipologías de Terrassa.
+| Dato | Fidelidad | Detalle |
+|---|---|---|
+| Huella de cada parte de edificio | ✅ | Catastro (precisión declarada 0,1 m), cajas alineadas a la orientación dominante del edificio, error ≤ 0,25 m |
+| Plantas de cada parte | ✅ | `numberOfFloorsAboveGround` por parte: un mismo edificio tiene volúmenes de distinta altura (cuerpo de 5 plantas + ático + patio de 1) |
+| Altura en metros | 🟡 | plantas × altura de planta según uso/época (3,2 m residencial, 3,5 ladrillo antiguo, 4 m vapors, 5,5 naves); el Catastro no da metros. Mejora: LiDAR ICGC |
+| Uso | ✅ | residencial / industrial / oficinas / comercio / equipamiento / agrario → tipología de fachada y comercios |
+| Año de construcción | ✅ | elige la época de la fachada (pre-1900 estuco y ladrillo, 1900-40 modernista/noucentista, 1950-80 bloques, >1990 moderno) |
+| Viviendas | ✅ | distingue casa unifamiliar (cases de cos) de bloque de pisos |
+| Cubiertas | 🟠 | el Catastro no da forma de cubierta: terrat por defecto, teja según época/tipología; `roof:shape` de OSM cuando existe |
+| Materiales y colores | 🔴 | por época y uso |
+| Edificios procedurales | 🔴 solo residual | únicamente en manzanas sin ningún edificio catastral ni huella OSM (campos, polígonos a medio construir) |
+| Comercios | 🟡 | 764 rótulos con nombre real de OSM en su portal; el resto sin rótulo o genérico |
 
 ### 2.6 Barrios
 
@@ -166,6 +179,23 @@ Hospital Mútua (17 plantas, 70 m), Estadi Olímpic, estaciones, chimeneas indus
 ---
 
 ## 3. Diario de desarrollo
+
+### 2026-10-24 — Sesión 2 (misma tarde)
+
+1. Primer arranque en el navegador del propietario: demasiados edificios inventados, falta de detalle. Diagnóstico:
+   el 75 % de los edificios no existe en OSM. Decisión: **Catastro INSPIRE** como fuente principal de edificios y
+   **comercios de OSM** para los rótulos. Descargas autorizadas y realizadas (`tools/catastro-to-json.py`,
+   `tools/data/q_shops.overpassql`).
+2. `geo-buildings.mjs` reescrito: Catastro primero (partes con plantas propias, uso, año, viviendas, referencia
+   catastral), OSM de relleno. 110.265 cajas (antes 35.858).
+3. `buildings.js` consume el nuevo esquema (plantas por volumen, época de fachada, rótulos reales de 547 comercios,
+   procedural solo en 207 manzanas vacías). 107 tests en verde. Masia Freixa: pendiente de fotos de referencia.
+4. Validado en el navegador por el propietario ("me encanta como va mejorando"). Segundo push a `slop-egara`.
+
+**Próximos pasos propuestos** (por impacto): (a) alturas reales por volumen con el LiDAR del ICGC; (b) relieve real
+(MDE 5 m) para la ciudad y el entorno, con puentes y túneles a su cota; (c) Masia Freixa y resto de monumentos con
+fotos de referencia; (d) polígonos oficiales de barris; (e) más comercios (completar OSM o datos del Ajuntament);
+(f) pasos de cebra reales en cruces sin semáforo; (g) inventarios municipales de arbolado y alumbrado.
 
 ### 2026-10-24 — Sesión 1
 
@@ -279,31 +309,24 @@ Hospital Mútua (17 plantas, 70 m), Estadi Olímpic, estaciones, chimeneas indus
 **Tests (`tests/`)**
 - `teleports.test.cjs` carga el city-config real: cada destino tiene botón, ninguno cae en manzana, todos en tierra, a ≤ 6 m de una calle. `city-map.test.cjs` y `cameras.test.cjs` con stubs de Terrassa. `geodata.test.mjs` construye los datos reales (15 s).
 
-### 5.4 Edificios (`js/buildings.js`)
+### 5.4 Edificios (`js/buildings.js`) — con Catastro (sesión 2)
 
-Dos caminos por manzana: **A, huellas reales** (manzanas con cobertura ≥ 35 % o ≥ 8 huellas: solo huellas; el resto, híbrido con reservas) y **B, procedural** con tipologías de Terrassa a partir de `blockProfile(b)`.
+Un único camino por manzana: **A, edificios reales** (1.543 manzanas con Catastro u OSM: 25.463 edificios, 110.265 volúmenes → 112.466 cajas) y **B, procedural** solo en las 207 manzanas edificables sin ningún edificio.
 
 | Elemento | Marca | Detalle |
 |---|---|---|
-| Huella de cada edificio (13.032 huellas OSM, cajas alineadas a su orientación propia, error ≤ 0,25 m; orientación verificada contra 145 contornos reales: 98 % de esquinas dentro) | ✅ Exacto | se omiten las huellas dentro de los recintos de `MODELLED_LANDMARKS` (las construye `landmarks.js`) |
-| Altura con `height` de OSM | ✅ Exacto | solo 13 edificios |
-| Altura por `building:levels` × planta (3,2 m residencial / 3,0 bloques / 3,5 ladrillo / 4 m vapors / 5,5 naves) | 🟡 Derivado | 388 edificios (torres de Can Jofresa 16 plantas → 56 m) |
-| Altura por perfil de barrio (rango de plantas, tipo OSM, superficie) con semilla determinista por posición | 🟠 Aproximado | ~12.600 huellas; casas ≤ 3 plantas, naves 6-9 m, iglesias 12-18 m, cobertizos 3 m |
-| Tipo de pared (medianera / fachada a calle con comercio o portal / patio) por sondeo geométrico | 🟡 Derivado | depende del ancho de acera modelado (2,4 m) |
-| Cubierta inclinada cuando OSM tiene `roof:shape` (13 huellas) | ✅ Exacto | prisma a dos aguas / cuatro aguas / un agua |
-| Terrats con caixa d'escala, cornisas, balcones, HVAC, toldos y rótulos (Forn de pa, Farmàcia, Bar Restaurant, Perruqueria, Queviures); cubiertas inclinadas en el resto según `flatRoof` del barrio | 🔴 Inventado | remates y porcentajes plausibles |
-| Colores / materiales de fachada (6 cubos: estuco ocre y rosado, ladrillo, moderno blanco, hormigón años 70, muro cortina) por tipo y barrio | 🔴 Inventado | el material real no está en OSM |
-| Edificios de las 1.441 manzanas sin huellas (o cobertura < 35 %): casco antiguo, cases de cos + bloques de esquina y pati d'illa, blocs, torres unifamiliares, naves con dents de serra i xemeneies, campus | 🔴 Inventado | mismo papel que los edificios procedurales de Manhattan en el original |
-| Lados de calle de cada solar y calles principales (más bloques y comercios) | 🟡 Derivado | sondeo de `blockAt` + `nearestRoads(...).major` |
-| Manzanas con cobertura 35-60 % (≈ 250) | 🟠 Aproximado | solo huellas reales: quedan huecos donde OSM está incompleto |
+| Huella de cada volumen (Catastro, cajas en el marco del edificio, error ≤ 0,25 m) | ✅ Exacto | se omiten los edificios cuyo centroide cae en un recinto de `MODELLED_LANDMARKS` |
+| Plantas de cada volumen (cuerpo, ático, cuerpo trasero, patio = plinto de 0,6 m) | ✅ Exacto | `numberOfFloorsAboveGround` por parte; solo las 1.711 huellas OSM sin `building:levels` usan las plantas típicas del barri |
+| Uso (residencial / agrario / industrial / oficinas / comercio / equipamiento) y año de construcción | ✅ Exacto | eligen tipología, cubo de fachada, altura de planta, comercio en planta baja y ornamento |
+| Metros por planta (3,1 residencial, 3,4 pre-1940, 3,6/4,0 planta baja comercial, 4,2 vapors y comercio, 6,5 naves, 3,5 oficinas, 3,8 equipamiento) | 🟡 Derivado | el Catastro no da metros. Mejora: LiDAR ICGC |
+| Medianera / fachada a calle / patio por sondeo geométrico (volúmenes del mismo edificio y vecinos a ≤ 1,5 m; acera y calzada a ≤ 9 m) | 🟡 Derivado | depende del ancho de acera modelado (2,4 m) |
+| Rótulos y toldos con el nombre real de 547 comercios de OSM en la pared a calle más próxima (≤ 14 m, 20 m en segunda pasada) | ✅ nombre exacto, 🟡 portal aproximado | los 217 restantes (gasolineras, grandes superficies, masies) quedan sin rótulo; ningún edificio sin comercio en OSM lleva rótulo |
+| Materiales y colores por época y uso (8 cubos: estuco ocre y rosado pre-1940, ladrillo de vapor, estuco liso 1940-60, bloques 1960-85, moderno beige/blanco, paneles de nave, muro cortina) | 🟠 Aproximado | la época es real, el material concreto es inventado |
+| Cubiertas: `roof:shape` de OSM cuando existe; si no, teja al 60 % en casas pre-1940 ≤ 2 plantas, dents de serra en naves pre-1960, terrat con caixa d'escala en el resto | 🔴 Inventado (salvo OSM) | el Catastro no da forma de cubierta |
+| Cornisas, balcones (85 % pre-1940, 60 % bloques), caixes d'escala, climatizadores | 🔴 Inventado | porcentajes plausibles por época |
+| Edificios procedurales en las 207 manzanas vacías | 🔴 Inventado | mismo generador que antes, nunca mezclado con huellas reales |
 
-**Cómo mejorar:**
-- *Huellas y alturas (prioridad máxima):* importar Catastro INSPIRE *Buildings* (municipio 08279: huella + `numberOfFloorsAboveGround` + año) o la *Base topogràfica 1:5.000* / *Edificacions 3D* (LiDAR MDS 2 m) del ICGC al mismo esquema `[θ, cx, cz, levels, height, kind, roof, rects, area]` en `tools/geo-buildings.mjs`: ×4 huellas, plantas reales en todas, el generador procedural dejaría de hacer falta en el núcleo urbano. El año de Catastro permitiría elegir el material de fachada por época.
-- *Cubiertas:* LiDAR ICGC (MDS−MDT por huella) o `roof:shape`/`roof:levels` en OSM; las dents de serra se ven en la ortofoto (ICGC 25 cm).
-- *Materiales:* tablas por barrio y época en `DISTRICT_PROFILES` (`city-config.js`) y ampliar los cubos en `buildings.js`.
-- *Comercios:* OSM tiene `shop=*` por portal: usarlos para colocar toldos y rótulos reales con el nombre del comercio.
-- *Manzanas 35-60 %:* con Catastro completo desaparece la ambigüedad; mientras tanto, rellenar solo los tramos de fachada > 8 m sin huella.
-- *Límites de barrio:* polígonos oficiales de `opendata.terrassa.cat` (§2.6).
+**Cómo mejorar:** alturas reales con LiDAR ICGC (MDS−MDT por volumen); cubiertas desde la ortofoto de 25 cm del ICGC o `roof:shape` en OSM; colocar los 217 comercios restantes buscando también paredes a patio/aparcamiento; completar los comercios de OSM (Terrassa tiene miles y OSM solo 868); fusionar volúmenes contiguos de igual altura para reducir los 112.466 colisionadores a la mitad; el atlas de rótulos es una textura de 4096×2304 (37 MB).
 
 ### 5.5 Monumentos (`js/landmarks.js`)
 

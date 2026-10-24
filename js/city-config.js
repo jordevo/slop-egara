@@ -286,6 +286,9 @@ const WATERWAYS = GEO.water.map((w) => ({ name: w.name, w: w.w, pts: toPts(w.pts
 const RAIL_LINES = GEO.rail.map((r) => ({ name: r.name, bridge: r.bridge, pts: toPts(r.pts) }));
 const STREET_TREES = toPts(GEO.trees);
 const SQUARES = GEO.squares.slice();
+// Named shops & businesses (OpenStreetMap POIs): the real signs at their real doors
+//   kind: 0 shop, 1 bar / restaurant / café, 2 bank, 3 pharmacy / health, 4 office, 5 hotel, 6 fuel, 7 other
+const SHOPS = (GEO.shops || []).map(([name, kind, type, x, z]) => ({ name, kind, type, x, z }));
 const parkByName = (name) => PARKS.find((p) => p.name === name) || null;
 /** The named park / square whose outline contains (x, z), or null */
 function parkAt(x, z) {
@@ -462,6 +465,7 @@ export {
   RAIL_LINES,
   STREET_TREES,
   SQUARES,
+  SHOPS,
   parkAt,
   parkByName,
   LANDMARK_SITES,

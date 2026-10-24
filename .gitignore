@@ -1,1 +1,5 @@
 .DS_Store
+# Catastro INSPIRE originals (380 MB of GML): re-download with tools/catastro-to-json.py instructions in HOW_TO_IMPROVE.md
+tools/data/catastro/*.gml
+tools/data/catastro/*.zip
+tools/data/catastro/*.xml

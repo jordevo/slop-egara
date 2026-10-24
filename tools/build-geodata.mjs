@@ -6,7 +6,7 @@ import { geo, log, centroid, cleanRing } from './geo-base.mjs';
 import { roadLines, buildRoadGraph } from './geo-roads.mjs';
 import { landRing, SIDEWALK } from './geo-blocks.mjs';
 import { blocks } from './geo-buildings.mjs';
-import { landuse, parks, trees, water, rail, landmarks, places, squares, region } from './geo-features.mjs';
+import { landuse, parks, trees, water, rail, landmarks, places, squares, region, shops } from './geo-features.mjs';
 
 const OUT = process.argv[2] || fileURLToPath(new URL('../js/terrassa-geodata.js', import.meta.url));
 const q = (v) => Math.round(v * 10) / 10;
@@ -51,6 +51,8 @@ const GEO = {
   landmarks,
   districts,
   squares: squares.map((s) => ({ name: s.name, x: q(s.xz[0]), z: q(s.xz[1]) })),
+  // Named shops & businesses: [name, kind (0 shop, 1 bar/restaurant, 2 bank, 3 pharmacy/health, 4 office, 5 hotel, 6 fuel, 7 other), OSM type, x, z]
+  shops: shops.map((s) => [s.name, s.kind, s.type, s.x, s.z]),
   region: {
     roads: region.roads.map((r) => [r.name, r.cls, r.link ? 1 : 0, flat(r.pts)]),
     rails: region.rails.map((r) => [r.name, r.narrow ? 1 : 0, flat(r.pts)]),

@@ -192,4 +192,35 @@ for (const e of osmRegion.elements) {
 }
 log(`region: ${region.roads.length} major road pieces, ${region.rails.length} railway pieces, ${region.settlements.length} settlement polygons, ${region.towns.length} towns, ${region.peaks.length} peaks`);
 
-export { landuse, parks, trees, water, rail, landmarks, places, squares, region, CLS_NAME };
+// ---------------------------------------------------------------------------------------------------------------------
+// Shops & businesses (osm_shops.json): the real street-level commerce, for the shop signs & awnings (buildings.js)
+//   kind: 0 shop, 1 bar / restaurant / café, 2 bank, 3 pharmacy / health, 4 office, 5 hotel, 6 fuel, 7 other
+// ---------------------------------------------------------------------------------------------------------------------
+const shops = [];
+try {
+  const osmShops = load('osm_shops.json');
+  const kindOf = (t) => {
+    if (t.shop) return 0;
+    if (/^(restaurant|cafe|bar|pub|fast_food|ice_cream|nightclub)$/.test(t.amenity || '')) return 1;
+    if (t.amenity === 'bank') return 2;
+    if (t.amenity === 'pharmacy' || t.healthcare || /^(dentist|clinic|doctors|veterinary|optician)$/.test(t.amenity || '')) return 3;
+    if (t.office) return 4;
+    if (t.tourism) return 5;
+    if (t.amenity === 'fuel') return 6;
+    return 7;
+  };
+  for (const e of osmShops.elements) {
+    const t = e.tags || {};
+    if (!t.name) continue;
+    const lon = e.type === 'node' ? e.lon : e.center && e.center.lon;
+    const lat = e.type === 'node' ? e.lat : e.center && e.center.lat;
+    if (lon === undefined || !geo.inDetail(lon, lat)) continue;
+    const [x, z] = toWorld(lon, lat);
+    shops.push({ name: t.name.trim(), kind: kindOf(t), type: t.shop || t.amenity || t.office || t.craft || t.healthcare || t.tourism || t.leisure || '', x: Math.round(x * 10) / 10, z: Math.round(z * 10) / 10, area: e.type !== 'node' ? 1 : 0 });
+  }
+  log(`${shops.length} named shops & businesses`);
+} catch (err) {
+  log(`no osm_shops.json (${err.message.split('\n')[0]}): shop signs stay generic`);
+}
+
+export { landuse, parks, trees, water, rail, landmarks, places, squares, region, shops, CLS_NAME };
