@@ -3,3 +3,6 @@
 tools/data/catastro/*.gml
 tools/data/catastro/*.zip
 tools/data/catastro/*.xml
+# ICGC elevation model (96 MB ASCII grid from the WCS, re-download: HOW_TO_IMPROVE.md §2.8)
+tools/data/dem/*.asc
+tools/data/dem/*.tif
