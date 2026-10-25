@@ -155,9 +155,11 @@ export function readGeoTiff(input) {
   return makeRaster({ width, height, data, nodata, epsg, toXY: centre });
 }
 
-/** Reads an Arc/Info ASCII grid (.asc / .txt): ncols nrows xllcorner|xllcenter yllcorner|yllcenter cellsize NODATA_value */
+/** Reads an Arc/Info ASCII grid (.asc / .txt, or gzipped .asc.gz): ncols nrows xllcorner|xllcenter yllcorner|yllcenter cellsize NODATA_value */
 export function readAsciiGrid(input, { epsg = null } = {}) {
-  const text = Buffer.isBuffer(input) ? input.toString('latin1') : fs.readFileSync(input, 'latin1');
+  let buf = Buffer.isBuffer(input) ? input : fs.readFileSync(input);
+  if (buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b) buf = zlib.gunzipSync(buf); // gzip magic
+  const text = buf.toString('latin1');
   const head = {};
   let pos = 0;
   for (let k = 0; k < 6; k++) {
@@ -187,9 +189,13 @@ export function readAsciiGrid(input, { epsg = null } = {}) {
   return makeRaster({ width, height, data, nodata, epsg, toXY: (col, row) => [x0 + col * cell, yTop - row * cell] });
 }
 
-/** Picks the reader by extension */
+/** Picks the reader by extension (a .gz suffix is stripped first: the ASCII grids ship gzipped in tools/data/dem/) */
 export function readRaster(path, opts) {
-  return /\.(asc|txt|agr|grd)$/i.test(path) ? readAsciiGrid(path, opts) : readGeoTiff(path);
+  const base = path.replace(/\.gz$/i, '');
+  if (/\.(asc|txt|agr|grd)$/i.test(base)) return readAsciiGrid(path, opts);
+  let buf = fs.readFileSync(path);
+  if (buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b) buf = zlib.gunzipSync(buf);
+  return readGeoTiff(buf);
 }
 
 function makeRaster(r) {

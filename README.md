@@ -60,8 +60,9 @@ La pipeline mesura ella mateixa el marc (origen al centre de la Plaça Vella, ei
 El relleu, `js/terrassa-terrain.bin`, surt del model d'elevacions de 5 m de l'ICGC (servei WCS) amb `tools/geo-terrain.mjs`, que a més l'acondiciona per a una ciutat: hi escriu els carrers amb el seu perfil, deixa els ponts com a taulers, estén cada illa des de la seva vorada i es queixa, en xifres, de tot el que encara fa pujada on no toca (HOW_TO_IMPROVE.md §2.8):
 
 ```bash
-curl "https://geoserveis.icgc.cat/icc_mdt/wcs/service?SERVICE=WCS&VERSION=1.0.0&REQUEST=GetCoverage&COVERAGE=icc:met&CRS=EPSG:25831&RESPONSE_CRS=EPSG:25831&BBOX=412010,4596910,423260,4608770&WIDTH=2250&HEIGHT=2372&FORMAT=ARCGRID" -o tools/data/dem/icgc_met5_terrassa_epsg25831.asc
-node tools/geo-terrain.mjs --epsg 25831 --smooth 5 tools/data/dem/icgc_met5_terrassa_epsg25831.asc
+# el model ja és al repositori, comprimit (tools/data/dem/*.asc.gz); per tornar-lo a baixar de l'ICGC:
+# curl "https://geoserveis.icgc.cat/icc_mdt/wcs/service?SERVICE=WCS&VERSION=1.0.0&REQUEST=GetCoverage&COVERAGE=icc:met&CRS=EPSG:25831&RESPONSE_CRS=EPSG:25831&BBOX=412010,4596910,423260,4608770&WIDTH=2250&HEIGHT=2372&FORMAT=ARCGRID" | gzip -9 > tools/data/dem/icgc_met5_terrassa_epsg25831.asc.gz
+node tools/geo-terrain.mjs --epsg 25831 --smooth 5 tools/data/dem/icgc_met5_terrassa_epsg25831.asc.gz
 ```
 
 A HOW_TO_IMPROVE.md §2 hi ha què conté cada extracte, els forats coneguts i les fonts millors per tapar-los.

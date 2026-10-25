@@ -179,6 +179,9 @@ test('Arc/Info ASCII grid', () => {
   assert.deepEqual([...r.data], VALUES);
   assert.deepEqual(r.toXY(0, 0), [400005, 4600000 + H * 10 - 5]);
   assert.equal(r.epsg, 25831);
+  // gzipped, as archived in tools/data/dem/
+  const g = readAsciiGrid(zlib.gzipSync(Buffer.from(txt)), { epsg: 25831 });
+  assert.deepEqual([...g.data], VALUES);
 });
 
 test('UTM 31N forward projection', () => {

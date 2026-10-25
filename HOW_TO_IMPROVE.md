@@ -189,12 +189,14 @@ Hospital Mútua (17 plantas, 70 m), Estadi Olímpic, estaciones, chimeneas indus
 
 **Fuente.** *Model d'Elevacions del Terreny* del ICGC a 5 m: el WCS `icc:met` de `geoserveis.icgc.cat/icc_mdt/wcs/service`
 (sirve `icc:met5`, ETRS89 / UTM 31N, ARCGRID; CC BY 4.0), descargado el 2026-10-25 con autorización del propietario para
-la caja de detalle + 450 m: 2.250 × 2.372 celdas (`tools/data/dem/icgc_met5_terrassa_epsg25831.asc`, 96 MB, en
-`.gitignore`). Para regenerarlo:
+la caja de detalle + 450 m: 2.250 × 2.372 celdas, **versionado en el repositorio sin pérdida y comprimido**
+(`tools/data/dem/icgc_met5_terrassa_epsg25831.asc.gz`, 22 MB; descomprimido son 96 MB y ese sí va en `.gitignore`),
+para que el relieve no dependa de que el servicio del ICGC siga ahí. Para regenerar el fichero del runtime:
 
 ```bash
-curl "https://geoserveis.icgc.cat/icc_mdt/wcs/service?SERVICE=WCS&VERSION=1.0.0&REQUEST=GetCoverage&COVERAGE=icc:met&CRS=EPSG:25831&RESPONSE_CRS=EPSG:25831&BBOX=412010,4596910,423260,4608770&WIDTH=2250&HEIGHT=2372&FORMAT=ARCGRID" -o tools/data/dem/icgc_met5_terrassa_epsg25831.asc
-node tools/geo-terrain.mjs --epsg 25831 --smooth 5 tools/data/dem/icgc_met5_terrassa_epsg25831.asc
+# el modelo está versionado comprimido (22 MB, sin pérdida) por si el servicio desaparece; para volver a bajarlo:
+# curl "https://geoserveis.icgc.cat/icc_mdt/wcs/service?SERVICE=WCS&VERSION=1.0.0&REQUEST=GetCoverage&COVERAGE=icc:met&CRS=EPSG:25831&RESPONSE_CRS=EPSG:25831&BBOX=412010,4596910,423260,4608770&WIDTH=2250&HEIGHT=2372&FORMAT=ARCGRID" | gzip -9 > tools/data/dem/icgc_met5_terrassa_epsg25831.asc.gz
+node tools/geo-terrain.mjs --epsg 25831 --smooth 5 tools/data/dem/icgc_met5_terrassa_epsg25831.asc.gz
 ```
 
 Cota de la Plaça Vella: 278,9 m. Relieve en la caja: −100 … +510 m (la Serra de l'Obac entra por el norte). El modelo
