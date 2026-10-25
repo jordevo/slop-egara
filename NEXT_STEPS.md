@@ -25,7 +25,7 @@ Principios de trabajo para no romper nada:
 
 ### 1.1 Relieve real (la mejora de más impacto visual que queda)
 
-> **Estado 2026-10-25 (rama `terrain`, `FEATURES.terrain`).** Hecho con el MDT real del ICGC (5 m, WCS): pipeline
+> **Estado 2026-10-25 (fusionado en `main`, conmutador `FEATURES.terrain`).** Hecho con el MDT real del ICGC (5 m, WCS): pipeline
 > (`tools/geo-terrain.mjs`: cotas por cruce, perfiles con limitador de pendiente, tableros de puente, membrana por
 > manzana, plataforma por edificio, informe procedimental), fichero `js/terrassa-terrain.bin` (10 m, cm, puentes),
 > `groundHeightAt()` como único punto de verdad (con nivel de puente), deck/aceras/bordillos drapeados sobre la

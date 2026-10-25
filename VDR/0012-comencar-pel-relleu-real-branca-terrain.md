@@ -1,7 +1,7 @@
 # VDR-0012 — Començar el full de ruta pel relleu real, en una branca `terrain` i darrere de `FEATURES.terrain`
 
 - **Data:** 2026-10-25
-- **Estat:** Acceptada (en curs: la branca `terrain` encara no s'ha fusionat a `main`)
+- **Estat:** Acceptada (fusionada a `main` el 2026-10-25, en avanç ràpid; el model de l'ICGC queda arxivat al repositori)
 
 ## Context
 
