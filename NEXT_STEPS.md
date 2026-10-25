@@ -25,6 +25,16 @@ Principios de trabajo para no romper nada:
 
 ### 1.1 Relieve real (la mejora de más impacto visual que queda)
 
+> **Estado 2026-10-25 (rama `terrain`, `FEATURES.terrain`).** Hecho con el MDT real del ICGC (5 m, WCS): pipeline
+> (`tools/geo-terrain.mjs`: cotas por cruce, perfiles con limitador de pendiente, tableros de puente, membrana por
+> manzana, plataforma por edificio, informe procedimental), fichero `js/terrassa-terrain.bin` (10 m, cm, puentes),
+> `groundHeightAt()` como único punto de verdad (con nivel de puente), deck/aceras/bordillos drapeados sobre la
+> retícula, edificios en la cota de su fachada con zócalo y escalonado, tráfico/peatones/jugador/cámara/audio sobre
+> el suelo, prueba de humo headless (`tools/browser-smoke.mjs`). **Pendiente:** pasos superiores sin etiqueta
+> `bridge` (hoy rampas), túneles, pilas/arcos de los puentes, gravedad en pendiente (§2.1.2), base por instancia en
+> los materiales de fachada de los monumentos, MDT de 2 m, el 2,8 % de aceras con montículo residual. Detalle:
+> `HOW_TO_IMPROVE.md` §2.8, §3 (sesión 3), §5.7.
+
 **Qué.** Terrassa no es plana: sube de ~250 m (Can Jofresa) a ~400 m (Can Tusell), con el torrent de Vallparadís
 8–15 m hundido, la Riera de les Arenes encajada 4–5 m, y la Serra de l'Obac al norte. Hoy la ciudad es un plano a y=0 y
 el relieve exterior es procedural.

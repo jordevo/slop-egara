@@ -185,9 +185,150 @@ Torre del Palau con `height=26.7`, Mercat de la Independència, Ajuntament, mNAC
 Hospital Mútua (17 plantas, 70 m), Estadi Olímpic, estaciones, chimeneas industriales con altura...).
 🟠 Altura: solo 13 tienen `height`; el resto usa la tabla de alturas por tipo del runtime (§4.6).
 
+### 2.8 Relieve (`geo-terrain.mjs`, `lib/geotiff.mjs`, `lib/utm.mjs`) — ✅ MDT del ICGC (5 m) + acondicionamiento urbano 🟡
+
+**Fuente.** *Model d'Elevacions del Terreny* del ICGC a 5 m: el WCS `icc:met` de `geoserveis.icgc.cat/icc_mdt/wcs/service`
+(sirve `icc:met5`, ETRS89 / UTM 31N, ARCGRID; CC BY 4.0), descargado el 2026-10-25 con autorización del propietario para
+la caja de detalle + 450 m: 2.250 × 2.372 celdas (`tools/data/dem/icgc_met5_terrassa_epsg25831.asc`, 96 MB, en
+`.gitignore`). Para regenerarlo:
+
+```bash
+curl "https://geoserveis.icgc.cat/icc_mdt/wcs/service?SERVICE=WCS&VERSION=1.0.0&REQUEST=GetCoverage&COVERAGE=icc:met&CRS=EPSG:25831&RESPONSE_CRS=EPSG:25831&BBOX=412010,4596910,423260,4608770&WIDTH=2250&HEIGHT=2372&FORMAT=ARCGRID" -o tools/data/dem/icgc_met5_terrassa_epsg25831.asc
+node tools/geo-terrain.mjs --epsg 25831 --smooth 5 tools/data/dem/icgc_met5_terrassa_epsg25831.asc
+```
+
+Cota de la Plaça Vella: 278,9 m. Relieve en la caja: −100 … +510 m (la Serra de l'Obac entra por el norte). El modelo
+LiDAR de 2 m del ICGC solo se sirve por WMS o por la aplicación de descarga interactiva; queda como mejora.
+
+**Formato de salida** (`js/terrassa-terrain.bin`, 1,8 MB, **sí va en el repositorio**): cabecera de 64 bytes (`TRN1`,
+w, h, celda, x0, z0, cota del origen, mín, máx, banderas, suavizado) + `Int16` little-endian en **centímetros sobre la
+Plaça Vella** (914 × 995 celdas de **10 m**, margen de 400 m, suavizado gaussiano σ = 5 m) + **tabla de puentes**
+(`BRDG`: índice del tramo del grafo y cota del tablero en cada extremo). El asfalto se dibuja exactamente sobre esta
+retícula, así que física, deck y geometría drapeada son la misma superficie.
+
+**Acondicionamiento urbano** (`--raw` lo desactiva). Un MDT de suelo desnudo no es el suelo por el que se conduce: baja a
+los torrentes embovedados, mantiene el valle bajo los puentes y lleva ruido (montículos, hoyos) donde se quitaron los
+edificios al generarlo. El runtime tiene una sola altura por (x, z) salvo en los puentes, así que la herramienta:
+1. **Cotas de cruce** (`nodeHeights`): mediana, entre las calzadas que llegan al cruce, de lo que cada una daría
+   **prolongada hasta él** (recta ajustada a sus 10–40 m: los primeros metros del modelo en un cruce son los más
+   ruidosos); caminos y viales de servicio solo si no llega ninguna calzada. En un estribo de puente manda la cota
+   **más alta** de las calzadas a menos de 45 m de camino por el grafo (OSM suele acabar el tramo de puente unos
+   metros talud abajo, y el anillo de una plaza está troceado en tramos de 4–7 m: el Pont del Passeig pasó de
+   11,4/8,8 m a 11,5/11,7 m en sus extremos). Los nodos solo de puente toman la media de sus vecinos. Si bajo un tablero pasa una calzada con menos de
+   4,6 m de gálibo (ya 1,5 m por debajo), se **elevan los dos estribos** (máx. 5 m; 19 puentes) y las calles de acceso
+   suben en rampa: nunca se excava la calle de debajo (`raiseBridgeAbutments`).
+2. **Perfil de cada calle** (`roadProfile`): media móvil de 40 m, corrección lineal para clavar los extremos en sus
+   cruces, **aplanado de crestas y hoyos cortos** (toda muestra a más de 0,3 m de la cuerda entre sus vecinas a ±15 m
+   se pone en la cuerda: una calle no tiene curvas verticales tan cortas) y **limitador de pendiente** (18 % calzadas,
+   45 % peatonales/escaleras) que recorta los acantilados que el modelo conserva donde la calle cruza un canal, un
+   muro o una terraza. Se escribe en la malla (`carveRoads`): toda celda que toque la calzada o su acera (2 m) es
+   entera de la calle, las celdas que comparten dos calles (cruces) se mezclan por cercanía a cada eje, 8 m de
+   transición al exterior; en dos pasadas, la segunda **al final** (después de membranas y plataformas, así la calzada
+   siempre manda) y convierte en rampa los cruces a distinto nivel sin etiqueta de puente. La zona de calle queda
+   marcada (`grid.roadMask`, `grid.carriagewayMask`). 🟡
+3. **Puentes** (140 tramos `bridge=yes`): **no se excavan**; son tableros rectos entre las cotas de sus estribos,
+   guardados en la tabla del fichero; bajo ellos el terreno se baja al menos 0,6 m (`clearUnderBridges`). 🟡
+4. **Manzanas urbanas** (≤ 260 m, 1.551): el interior es una **membrana** tendida desde la línea de bordillo
+   (inversa de la distancia⁴ de muestras cada 4 m): no puede tener bultos ni hoyos respecto a sus calles
+   (`membraneBlocks`). Las 155 manzanas grandes (polígonos, laderas con casas dispersas) conservan el modelo salvo una
+   franja de 24 m tras el bordillo; el suelo abierto conserva el modelo. 🟡
+5. **Plataforma por edificio** (`flattenBuildings`, 1.082): solo en las manzanas grandes que conservan el modelo
+   (en una manzana urbana la membrana ya es lisa y una plataforma solo pone escalones entre vecinos o un montículo
+   en una puerta, como se vio en Colom–Carretera de Montcada); bajo la parte interior de la huella, nunca en la
+   franja junto a la calle, y **nunca por encima de la calle más baja a la que da el edificio**: las naves en ladera
+   quedan sobre su terraza. 🟡
+6. **Informe procedimental** sobre toda la ciudad (`report`, el propietario pidió verificación procedimental, no por
+   capturas): pendientes por clase de vía (p50 2,7 %, p90 7,3 %, p99 14,5 %), tramos de calzada > 18 % (107, casi
+   todos enlaces de autopista a dos niveles sin etiqueta de puente), escalones > 1 m en calzada (124), **crestas y
+   hoyos cortos** en calzada (> 0,3 m respecto a una cuerda de 30 m: 1.232 muestras, eran 2.204; 612 en enlaces de
+   autopista), tableros (140), escalón de bordillo por manzana (37 > 1 m, máx. 2,9 m), **montículos de acera**
+   (bordillo contra línea de fachada 4 m adentro: 2.548 de 124.161 muestras > 0,5 m, 2,1 %; eran 9.727). 🟠
+   Pendiente: pasos superiores sin etiqueta, túneles, tramos cortos entre cruces a distinta cota, lo que la malla de
+   10 m no puede representar (la acera de una calle de 6 m y el interior de su manzana caen en la misma celda).
+
+**Lector propio de GeoTIFF / ASC** (`tools/lib/geotiff.mjs`): sin GDAL ni dependencias npm. Clásico y BigTIFF, tiras o
+teselas, compresión none / deflate / LZW / PackBits, predictores 2 y 3, enteros de 8–32 bits y flotantes de 32/64,
+georreferencia por `ModelPixelScale`+`ModelTiepoint` o `ModelTransformation`, EPSG por GeoKeys, `GDAL_NODATA`; ASCII grid
+de Arc/Info. Proyección directa UTM (GRS80) en `tools/lib/utm.mjs`. El marco del mundo se lee de `GEO.frame`. Tests:
+`tests/geo-terrain.test.mjs` (escribe TIFFs sintéticos de cada variante y los lee), `tests/terrain.test.cjs` (runtime).
+`--synthetic` genera un relieve inventado marcado en la cabecera, solo para desarrollo sin datos.
+
 ---
 
 ## 3. Diario de desarrollo
+
+### 2026-10-25 — Sesión 3 (madrugada): relieve
+
+1. Se empieza por `NEXT_STEPS.md` §1.1 (relieve real) en la rama `terrain`, detrás de `FEATURES.terrain`
+   (`js/city-config.js`). Sin permiso aún para descargar el MDT del ICGC, todo se desarrolla y prueba con un relieve
+   **sintético** marcado como tal (§2.8).
+2. Pipeline: `tools/geo-terrain.mjs` + lector GeoTIFF/ASC propio + proyector UTM. Runtime: `js/terrain.js`
+   (`terrainY`, `terrainGradient`, `refineGeometry`, `latticeCapGeometry`, `drapeGeometry`, `buildTerrainTiles`).
+3. Integración: `groundHeightAt()` (`city-grid.js`) = altura local + relieve: el único punto de verdad. Deck en
+   losetas de 500 m sobre la retícula del relieve; losas, bordillos, bancales, vallas y caminos drapeados vértice a
+   vértice; bordillos como muro exterior + tira superior; edificios asentados en la cota mínima de su huella
+   (`buildings.js`, con el atributo `base` por instancia para que las hileras de ventanas no se desplacen,
+   `tsl-materials.js`); monumentos por `Sink.base` (`landmarks.js`); pintura vial troceada a 6 m (`road-paint.js`);
+   tráfico con cota y cabeceo según la pendiente (`traffic.js`); coche del jugador con cabeceo/balanceo de pendiente
+   (`controllers.js`); mobiliario, árboles, placas y luces elevados (`street-details.js`); terreno regional fusionado
+   con el real y recortado bajo el deck (`surroundings.js`); carga del fichero antes de construir (`main.js`).
+4. Primera prueba en el navegador del propietario: **pantalla negra**. Causa: el refinado por bisección de aristas
+   convertía las aceras en 9 M de triángulos (un búfer de 331 MB por encima del `maxBufferSize` de WebGPU, 256 MB) y
+   20 s de construcción. Solución: recorte de cada triángulo contra la **retícula del propio deck** (líneas x, z y
+   diagonales), geometría indexada con vértices compartidos, caras inferiores descartadas, losas construidas
+   directamente sobre la retícula (`latticeCapGeometry`). Medido en Chrome headless: vértices del suelo de ~23 M a
+   ~7 M, `cityGrid` de 20 s a ~4,5 s (0,5 s sin relieve), 0 errores de WebGPU.
+5. Segunda ronda de pruebas del propietario (con el relieve sintético): calzadas que se hunden en los puentes,
+   edificios enterrados, farolas flotando, sonido que se iba con la cota, cámara en tercera persona por encima del
+   coche. Diagnóstico y arreglos: (a) acondicionamiento urbano del relieve en la herramienta (calles escritas con su
+   perfil, puentes como rampas, manzanas como planos robustos, §2.8); (b) celda de 10 m y deck/drapeado alineados
+   exactamente con la retícula del relieve (farolas y losas coinciden); (c) dos suelos absolutos de la cámara
+   (`Math.max(0.65, y + h)`) sustituidos por el suelo bajo la cámara (`cameras.js`); (d) altura sobre el relieve en el
+   audio: vehículos del tráfico, peatones, helicóptero (`audio-sources.js`); (e) patios de manzana como losas de
+   2,5 m de canto (muro de contención en vez de borde flotante). El error `points[l-1].equals is not a function` fue
+   un `Vector2` que faltaba en `triangulateShape`.
+6. Prueba de humo headless nueva: `tools/browser-smoke.mjs` (Chrome por DevTools Protocol sin dependencias; espera el
+   `[init]`, teletransporta por el gancho `window.__slop`, captura pantallas y evalúa expresiones). Con ella se midió:
+   75.342 volúmenes de edificio, 8.0 k enterrados > 1 m y 2.1 k > 2 m en el relieve **sintético** (zanjas verticales
+   de 9 m que cruzan manzanas; se espera mucho menos con el MDT real), 178 "flotantes" > 0,3 m (casi todos artefactos
+   de medir esquinas AABB de edificios girados junto a las zanjas).
+7. **MDT real** (autorización del propietario): WCS del ICGC, 5 m (§2.8). Con datos reales afloraron los problemas de
+   un acondicionamiento ingenuo: pendientes imposibles (p99 del 38 %), escalones de 17 m en bordillos (tope del 6 %
+   absurdo en barrios de ladera), 11.900 volúmenes enterrados > 2 m. Rehecho: cotas robustas por cruce, perfiles
+   anclados con limitador de pendiente, puentes como **tableros** (tabla en el fichero, `bridgeAt`/`surfaceY` en
+   `terrain.js`, `groundHeightAt(x, z, hint)` elige el nivel más cercano al que pregunta, tráfico y peatones por el
+   `bridge` de su arista, tablero con calzada de asfalto, aceras, pretiles y colisionadores en `city-grid.js`),
+   membrana por manzana y plataforma por edificio.
+8. **Asiento de los edificios** (regla del propietario: "si sabemos su forma, ha de empezar desde el suelo, siempre",
+   sin apaños): cada **volumen** (no cada edificio: un registro rural del Catastro reparte construcciones a cientos de
+   metros) se asienta en la cota **más alta de sus fachadas a la calle**; si no tiene fachada, en la mediana de sus
+   esquinas; un volumen superior toma el de abajo. Debajo, un **zócalo ciego** hasta el punto más bajo del terreno bajo
+   su huella (nada flota). Las fachadas de más de 18 m que suben más de 1 m se **escalonan**. Los monumentos, en el
+   percentil 90 de su contorno con zócalo de hormigón. Métrica final (navegador): 115.517 volúmenes, 50.962 zócalos
+   (1.559 > 3 m), 2.134 escalones, 1.617 volúmenes con la trasera enterrada > 2 m (naves en ladera y polígonos del
+   oeste, donde las plataformas no entran en la franja de calle).
+9. Errores encontrados por el propietario y corregidos: postes y placas de calle elevados dos veces
+   (`groundY` ya traía el relieve y `pushMatrix` lo sumaba de nuevo), árboles de parque elevados dos veces
+   (`parkTreeSites` → `treePositions`), `Vector2` en `triangulateShape`, parpadeo en los puentes (pintura vial
+   recortada con la misma retícula que el asfalto, gap bajo los tableros, caras coplanarias del pretil), asfalto del
+   tablero de otro color, tablero inclinado por un camino que bajaba al parque (cotas de estribo), **montículos en
+   aceras** (plataformas de edificio invadiendo la franja de acera: ahora la acera es plana en su anchura y la
+   plataforma solo entra bajo el interior del edificio), cámara y audio con cotas absolutas.
+10. Segunda ronda del propietario: montículo en Colom–Carretera de Montcada (plataforma de edificio en manzana
+    urbana: ahora solo en manzanas grandes y nunca sobre la calle de la puerta), placas de calle aún dobles
+    (`addPlaque` sumaba el relieve y `pushMatrix` otra vez), **gente volando en el punto de aparición** (eran los
+    modos aparcados del jugador: el ciclista y el peatón se creaban a y = 0; `spawnAt` ya asienta en el relieve),
+    chispas de colisión en la cota 0 (ahora a la del vehículo), **vehículos y peatones que desaparecían antes de
+    cruzarse** (la prueba de frustum del tráfico suponía el suelo a y = 1: ahora usa la cota real), **crestas en
+    calles** (cotas de cruce por extrapolación, aplanado de crestas cortas, celdas enteras para la calle, mezcla en
+    cruces, calzada escrita al final, estribos elevados en vez de excavar la calle de debajo). Tercera ronda:
+    el Pont del Passeig inclinado (estribo de la Mútua leído en tramos de 4–7 m: ahora se recorren 45 m del grafo)
+    y el coche "haciendo cosas raras" sobre él: cabeceaba y balanceaba con el gradiente del **terreno** (el valle
+    bajo el puente), ahora con la superficie que pisa (`getGroundHeight` con su propia cota como pista, ±1,4 m).
+11. Pendiente: pasos superiores sin etiqueta `bridge` (C-58, N-150: hoy rampas limitadas al 18 %), túneles, pilas y
+    arcos de los puentes, cámara de persecución sin colisión con edificios (preexistente, se nota más en laderas),
+    gravedad en pendiente (§2.1.2), MDT de 2 m, lo que la malla de 10 m no resuelve (acera e interior de manzana en
+    la misma celda en calles estrechas). Tests: 133 en verde.
 
 ### 2026-10-24 — Sesión 2 (misma tarde)
 
@@ -259,6 +400,7 @@ fotos de referencia; (d) polígonos oficiales de barris; (e) más comercios (com
 | 4.8 `nyc-map.js` → `city-map.js` | ✅ hecho (ver §5.3) | Suelo = término municipal; etiquetas de barrios; sin puentes/muelles |
 | 4.9 `boroughs.js` → `surroundings.js` | ✅ hecho (ver §5.2) | Municipios vecinos como suelo de bajo detalle, polígonos de asentamiento con edificios genéricos, autopistas y ferrocarriles de la región, silueta de montañas (La Mola 1.104 m, Montcau 1.056 m, Serra de l'Obac) |
 | 4.10 UI / HUD (`index.html`, `css/style.css`, `cameras.js`, README) | ✅ hecho (ver §5.3) | Nombre, unidades métricas (km/h, m), textos, iconos, fuentes |
+| 4.14 `terrain.js` + integración en `city-grid.js`, `buildings.js`, `landmarks.js`, `street-details.js`, `road-paint.js`, `traffic.js`, `controllers.js`, `cameras.js`, `audio-sources.js`, `surroundings.js`, `main.js` | ✅ hecho, ⚪ datos reales pendientes (ver §2.8, §5.7) | `FEATURES.terrain`: el relieve se carga de `js/terrassa-terrain.bin` y todo lo que toca el suelo pasa por `groundHeightAt()`; sin el fichero la ciudad sigue plana |
 | 4.11 Tests | ✅ hecho | `teleports`, `city-map`, `cameras`, `controllers`, `geodata`, `traffic*`, `vehicle-lights` en verde; `boot` pasa tras la integración | Actualizar `teleports.test.cjs`, `boot.test.cjs`, stubs |
 
 ---
@@ -396,3 +538,18 @@ Pendiente general: todas las alturas 🟠 pueden sustituirse por el modelo 3D de
 | Árboles viarios | 834 ✅ (753 colocados) / alineaciones 🔴 | Plátanos cada 7–8 m en calles ≥ 9 m, ornamentales en el 30 % de calles residenciales. Mejora: inventari d'arbrat viari del Ajuntament |
 | Papeleras, bolardos, bancos | 🔴 | Papelera junto a semáforos y 30 % de farolas; bolardos cada 2,5 m en peatonales; bancos tipo Neobarcino en parques y plazas |
 | Mobiliario eliminado | — | Sin bocas de metro, carritos, hidrantes, buzones, chimeneas de vapor ni barreras de Nueva York |
+
+### 5.7 Relieve (`js/terrain.js` y módulos integrados)
+
+| Elemento | Fidelidad | Detalle |
+|---|---|---|
+| Alturas del terreno | ✅ MDT ICGC 5 m → 10 m | §2.8; el fichero generado (`js/terrassa-terrain.bin`) va en el repositorio, el ASC de 96 MB no |
+| Deck de asfalto | 🟡 | Malla de la retícula del relieve (10 m) en losetas de 500 m, faldón perimetral de 30 m; frustum culling por loseta |
+| Aceras, bordillos, parques | 🟡 | Drapeado exacto sobre la retícula (`latticeCapGeometry`, `refineGeometry`); bordillo = muro exterior + tira de 0,25 m; patios de manzana con 2,5 m de canto |
+| Vallparadís y rieras | 🟠 | Con relieve, las excavaciones sintéticas de `city-grid.js` (parques hundidos, canales) se desactivan: el valle lo da el modelo; los canales de hormigón de las rieras quedan para cuando haya datos (son lechos planos sobre el terreno) |
+| Calles | 🟡 | Cotas por cruce + perfil suavizado con limitador de pendiente (§2.8); puentes como tableros rectos con asfalto, aceras y pretiles (sin pilas ni arcos 🟠); pasos superiores sin etiqueta como rampas 🟠; túneles excluidos ⚪ |
+| Manzanas edificadas | 🟡 | Membrana desde el bordillo (≤ 260 m) + plataforma bajo el interior de cada edificio; cada volumen en la cota de su fachada a la calle, zócalo ciego hasta el terreno más bajo, escalonado en fachadas largas (§3 sesión 3, puntos 7–9) |
+| Monumentos | 🟡 | Percentil 90 de su contorno (`Sink.base`) con zócalo de hormigón; las hileras de ventanas de los materiales "world-space" se desplazan con la cota (pendiente: atributo de base como en `buildings.js`) |
+| Vehículos y peatones | 🟡 | Cota y cabeceo según la pendiente bajo cada eje, tablero de puente cuando su arista es un puente; el coche del jugador cabecea/balancea con el gradiente y se queda en su nivel al pasar bajo un puente (`hint`); sin gravedad en pendiente aún (§2.1.2) |
+| Cámara y audio | ✅ | Todas las alturas son sobre el suelo (`groundHeightAt`/`terrainY`), no cotas absolutas |
+| Entorno regional | 🟠 | Dentro de la caja, el real; fuera, la cota del borde + montañas procedurales; celdas de 100 m bajo el deck no se dibujan; puede verse un escalón en el límite de la caja |
