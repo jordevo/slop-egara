@@ -4,7 +4,8 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { SIGNAL_TIMING, blockAt, STREET_TREES, nearestRoads, prettyName, UNNAMED, LAND_CLASS, WORLD_BOUNDS, blockProfile } from './city-config.js';
 import { cityUniforms, createTreeGrateMaterial } from './tsl-materials.js';
 import { createTreeField } from './trees.js';
-import { pavedPlazaRects, parkTreeSites, sidewalkBlocks, parkLampSites, groundHeightAt } from './city-grid.js';
+import { pavedPlazaRects, parkTreeSites, sidewalkBlocks, parkLampSites, localGroundAt } from './city-grid.js';
+import { terrainActive, terrainY } from './terrain.js';
 import { GEO } from './terrassa-geodata.js';
 
 // js/street-details.js
@@ -301,8 +302,10 @@ function buildStreetDetails(scene, opts = {}) {
   const audioSignals = [];
   const spotSites = []; // column luminaires: pooled spot lights { x, y, z, tx, tz }
   const pointSites = []; // lanterns, posts & park lamps: pooled point lights { x, y, z, color, intensity, dist }
+  // The relief (terrain.js) under every prop authored at kerb height: added as the matrices are written
+  const lift = terrainActive() ? terrainY : () => 0;
   const pushMatrix = (list, x, y, z, yaw = 0, sx = 1, sy = 1, sz = 1) => {
-    dummy.position.set(x, y, z);
+    dummy.position.set(x, y + lift(x, z), z);
     dummy.rotation.set(0, yaw, 0);
     dummy.scale.set(sx, sy, sz);
     dummy.updateMatrix();
@@ -367,9 +370,9 @@ function buildStreetDetails(scene, opts = {}) {
     const s = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453;
     return s - Math.floor(s);
   }
-  // Where the ground is under a pole: the sidewalk top on an island (the walks of the sunken rieres included), 0 on
-  // the roadway (city-grid.js)
-  const groundY = (x, z) => groundHeightAt(x, z);
+  // Where the ground is under a pole, without the relief: the sidewalk top on an island (the walks of the sunken
+  // rieres included), 0 on the roadway (city-grid.js). The relief is added once, by pushMatrix / addPlaque
+  const groundY = (x, z) => localGroundAt(x, z);
 
   // ---- The facades: a spatial hash of the building colliders --------------------------------------------------------
   // Everything hung "on a facade" (the street plaques, the old town's wall lanterns) is only mounted where one of the
@@ -634,6 +637,7 @@ function buildStreetDetails(scene, opts = {}) {
   const PLAQUE_Y = 2.65; // above the sidewalk
   let plaquesOnWalls = 0, plaquesOnPoles = 0, plaquePoles = 0, plaquesSkipped = 0;
   function addPlaque(name, x, y, z, yaw) {
+    // y is the kerb-height mount; pushMatrix lifts it onto the relief (once)
     const key = `${name}|${Math.round(x / 2)}|${Math.round(z / 2)}`;
     if (plaqueKeys.has(key)) return false;
     plaqueKeys.add(key);
@@ -1001,6 +1005,12 @@ function buildStreetDetails(scene, opts = {}) {
   const pitCurbGeo = new THREE.BoxGeometry(1.5, 0.16, 2.2);
   const pitSoilGeo = new THREE.BoxGeometry(1.2, 0.15, 1.9);
   const pitGrateGeo = new THREE.RingGeometry(0.24, 0.72, 12, 1).rotateX(-Math.PI / 2);
+  // Onto the relief: the trees, lights & signal sounds authored at kerb height (the park trees of city-grid.js
+  // arrive already lifted: `lifted`)
+  for (const t of treePositions) if (!t.lifted) t.y += lift(t.x, t.z);
+  for (const l of pointSites) l.y += lift(l.x, l.z);
+  for (const l of spotSites) l.y += lift(l.x, l.z);
+  for (const a of audioSignals) a.y += lift(a.x, a.z);
   const gratedTrees = sidewalkTreePositions.filter((t) => t.grate !== false && (t.pitS || 1) >= 1);
   if (sidewalkTreePositions.length) {
     const pitCurbInst = new THREE.InstancedMesh(pitCurbGeo, pitCurbMat, sidewalkTreePositions.length);
@@ -1010,10 +1020,10 @@ function buildStreetDetails(scene, opts = {}) {
     sidewalkTreePositions.forEach((t, i) => {
       dummy.rotation.set(0, t.pitRot || 0, 0);
       dummy.scale.set(t.pitS || 1, 1, t.pitS || 1);
-      dummy.position.set(t.x, SW_TOP - 0.02, t.z);
+      dummy.position.set(t.x, SW_TOP - 0.02 + lift(t.x, t.z), t.z);
       dummy.updateMatrix();
       pitCurbInst.setMatrixAt(i, dummy.matrix);
-      dummy.position.set(t.x, SW_TOP - 0.03, t.z);
+      dummy.position.set(t.x, SW_TOP - 0.03 + lift(t.x, t.z), t.z);
       dummy.updateMatrix();
       pitSoilInst.setMatrixAt(i, dummy.matrix);
     });
@@ -1029,7 +1039,7 @@ function buildStreetDetails(scene, opts = {}) {
     gratedTrees.forEach((t, i) => {
       dummy.rotation.set(0, 0, 0);
       dummy.scale.set(1, 1, 1);
-      dummy.position.set(t.x, SW_TOP + 0.052, t.z);
+      dummy.position.set(t.x, SW_TOP + 0.052 + lift(t.x, t.z), t.z);
       dummy.updateMatrix();
       pitGrateInst.setMatrixAt(i, dummy.matrix);
     });

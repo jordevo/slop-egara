@@ -3,8 +3,9 @@ import { pass, mrt, output, normalView, positionView, metalness, roughness, vec2
 import { ssr } from 'three/addons/tsl/display/SSRNode.js';
 import { createPostProcessing } from './post-processing.js';
 import { ClusteredLighting } from 'three/addons/lighting/ClusteredLighting.js';
-import { getLocationLabel, isTypingInField, ROADS, CITY_LANDMARKS, TELEPORT_LOCATIONS } from './city-config.js';
-import { buildCityGrid } from './city-grid.js';
+import { getLocationLabel, isTypingInField, ROADS, CITY_LANDMARKS, TELEPORT_LOCATIONS, FEATURES } from './city-config.js';
+import { loadTerrain, terrainY } from './terrain.js';
+import { buildCityGrid, groundHeightAt } from './city-grid.js';
 import { buildSurroundings } from './surroundings.js';
 import { buildLandmarks } from './landmarks.js';
 import { buildCityBlocks } from './buildings.js';
@@ -73,7 +74,10 @@ async function initApp() {
     loadingStatus.textContent = 'Constructing Terrassa: streets, blocks, landmarks & streetscape...';
   }
 
-  // 3. Build Terrassa's geography, landmarks, blocks, street details & traffic
+  // 3. Build Terrassa's geography, landmarks, blocks, street details & traffic — on the real relief when its data
+  //    file is there (terrain.js; everything below reads the ground through city-grid.js groundHeightAt)
+  if (FEATURES.terrain) await loadTerrain(new URL(FEATURES.terrainFile, document.baseURI).href);
+  markInit('terrain');
   const cityGrid = buildCityGrid(scene);
   markInit('cityGrid');
   const surroundings = buildSurroundings(scene);
@@ -716,6 +720,25 @@ async function initApp() {
         markInit('gpu');
         console.log(`[init] ${initTimings.join(', ')}`);
         initTimings = null;
+        // A small hook for the headless smoke test (tools/browser-smoke.mjs): teleports by name or coordinates
+        window.__slop = {
+          scene,
+          colliders: allColliders,
+          seating: cityBlocks.seating,
+          traffic: trafficSystem,
+          entities: controllerManager.entities,
+          groundHeightAt,
+          terrainY,
+          locations: TELEPORT_LOCATIONS,
+          teleport(x, z, heading = Math.PI, mode = 'car') {
+            const loc = typeof x === 'string' ? TELEPORT_LOCATIONS[x] : null;
+            if (typeof x === 'string' && !loc) return `unknown location ${x}`;
+            controllerManager.setMode(mode);
+            controllerManager.teleportActiveTo(loc ? loc.x : x, loc ? loc.z : z, loc ? loc.heading : heading);
+            const e = controllerManager.entities[controllerManager.activeMode];
+            return { x: e.position.x, y: e.position.y, z: e.position.z };
+          }
+        };
         if (loadingOverlay) loadingOverlay.classList.add('hidden');
         audioSystem.ready = true;
         setLoadingProgress(1);

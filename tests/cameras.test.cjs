@@ -80,7 +80,7 @@ function cameraHarness(entity = {
   window.innerHeight = 900;
   const { CameraSystem } = loadModule(source, {
     globals: { window, document },
-    imports: { 'three/webgpu': { Vector3, PerspectiveCamera }, './city-config.js': cityConfigStub() }
+    imports: { 'three/webgpu': { Vector3, PerspectiveCamera }, './city-config.js': cityConfigStub(), './city-grid.js': { groundHeightAt: () => 0 } }
   });
   const camera = new CameraSystem(canvas, { getActiveEntity: () => entity });
   return {

@@ -1,4 +1,5 @@
 import * as THREE from 'three/webgpu';
+import { terrainActive, terrainY } from './terrain.js';
 import {
   Fn,
   float,
@@ -345,6 +346,10 @@ function buildCityBlocks(scene) {
   // generator works in the frame as on a grid block and everything it emits is turned into place as it is emitted
   // (place), so buildings line up with their street / their real walls.
   let xf = null; // { th, cs, sn, px, pz }
+  // The relief (terrain.js) under the building being emitted: the lowest terrain under its footprint, added to every
+  // y that place() & pushCollider() emit (the generator works at ground = 0)
+  const relief = terrainActive();
+  let baseY = 0;
   // The lot rectangle being populated by the procedural generator (frame coords) with the sides of it that face a
   // street: { x0, x1, z0, z1, streets: { n, s, w, e }, major: { n, s, w, e } }
   let cur = null;
@@ -353,6 +358,8 @@ function buildCityBlocks(scene) {
     : [x, z]);
   // Player collider over the rect [x0, x1] x [z0, z1] (of the current frame): an oriented box inside its world AABB
   function pushCollider(x0, x1, z0, z1, minY, maxY) {
+    minY += baseY;
+    maxY += baseY;
     if (!xf) {
       colliders.push({ minX: x0, maxX: x1, minZ: z0, maxZ: z1, minY, maxY });
       return;
@@ -371,6 +378,7 @@ function buildCityBlocks(scene) {
       [o.x, o.z] = toWorld(o.x, o.z);
       o.ry = xf.th;
     }
+    if (baseY && o.y !== undefined) o.y += baseY;
     if (o.nx !== undefined) {
       const c = xf ? xf.cs : 1;
       const s = xf ? xf.sn : 0;
@@ -830,6 +838,42 @@ function buildCityBlocks(scene) {
     blk.yards.push({ x0: cx - hw, x1: cx + hw, z0: cz - hd, z1: cz + hd, ry: xf ? xf.th : 0 });
   }
 
+  // Seating statistics (the smoke test reads them: window.__slop.seating)
+  const seating = { parts: 0, plinths: 0, plinthsOver3m: 0, maxPlinth: 0, steps: 0, rearBuriedOver2m: 0, worstPlinths: [], worstBuried: [] };
+  const noteWorst = (list, x, z, v) => { list.push([Math.round(x), Math.round(z), +v.toFixed(1)]); list.sort((a, b) => b[2] - a[2]); if (list.length > 5) list.length = 5; };
+  // A ground-floor part whose street front is long and climbs more than a metre becomes a row of steps along that
+  // front (each seated on its own): the cut walls between steps are blank party walls
+  function stepParts(src) {
+    const out = [];
+    const isFront = (p, side) => p.faces[SIDE_IDX[side]] <= WALL_KINDS.entry;
+    const split = (p, axis) => {
+      const C = corners(p.x0, p.x1, p.z0, p.z1); // [x0z0, x1z0, x1z1, x0z1]
+      const L = axis === 'x' ? p.x1 - p.x0 : p.z1 - p.z0;
+      if (L < 18) return [p];
+      const h = C.map((c) => terrainY(c.x, c.z));
+      let climb = 0;
+      if (axis === 'x') { if (isFront(p, 'n')) climb = Math.max(climb, Math.abs(h[0] - h[1])); if (isFront(p, 's')) climb = Math.max(climb, Math.abs(h[3] - h[2])); }
+      else { if (isFront(p, 'w')) climb = Math.max(climb, Math.abs(h[0] - h[3])); if (isFront(p, 'e')) climb = Math.max(climb, Math.abs(h[1] - h[2])); }
+      if (climb < 1.0) return [p];
+      const n = Math.min(6, Math.max(2, Math.ceil(climb / 1.0)));
+      const pieces = [];
+      for (let k = 0; k < n; k++) {
+        const q = { ...p, faces: p.faces.slice() };
+        const t0 = k / n, t1 = (k + 1) / n;
+        if (axis === 'x') { q.x0 = p.x0 + L * t0 + (k ? 0.01 : 0); q.x1 = p.x0 + L * t1 - (k < n - 1 ? 0.01 : 0); if (k) q.faces[SIDE_IDX.w] = WALL_KINDS.lotLine; if (k < n - 1) q.faces[SIDE_IDX.e] = WALL_KINDS.lotLine; }
+        else { q.z0 = p.z0 + L * t0 + (k ? 0.01 : 0); q.z1 = p.z0 + L * t1 - (k < n - 1 ? 0.01 : 0); if (k) q.faces[SIDE_IDX.n] = WALL_KINDS.lotLine; if (k < n - 1) q.faces[SIDE_IDX.s] = WALL_KINDS.lotLine; }
+        pieces.push(q);
+      }
+      seating.steps += n - 1;
+      return pieces;
+    };
+    for (const p of src) {
+      if (p.plinth || p.y0 > EPS) { out.push(p); continue; }
+      for (const q of split(p, 'x')) out.push(...split(q, 'z'));
+    }
+    return out;
+  }
+
   /**
    * Emits building `b`: facade boxes, map footprints, colliders matching each part, cornices under the masonry roof
    * lines, the roof (a terrat with its stair bulkhead, a mechanical roof, a sawtooth or a pitched tile roof), balcony
@@ -841,25 +885,82 @@ function buildCityBlocks(scene) {
    *      (balconies on the long sides only), freestanding, walls (see wallKinds) }
    */
   function commit(blk, b, o = {}) {
-    const parts = b.parts;
-    if (!parts.length) return false;
-    if (!b.real && parts.some((p) => hitsReserve(p.x0, p.x1, p.z0, p.z1))) return false;
+    if (!b.parts.length) return false;
+    if (!b.real && b.parts.some((p) => hitsReserve(p.x0, p.x1, p.z0, p.z1))) return false;
     const mat = b.mat;
     const storey = b.sh;
     const tone = rand();
     let shopsOn = o.shops ?? 'all';
     if (typeof shopsOn === 'number') shopsOn = tone < shopsOn ? 'all' : 'none';
     const shops = { w: shopsOn === 'all', e: shopsOn === 'all', n: shopsOn === 'all', s: shopsOn === 'all' };
+    const BLANK = [WALL_KINDS.blankStone, WALL_KINDS.blankStone, WALL_KINDS.blankStone, WALL_KINDS.blankStone];
+    const facesOf = (p) => (p.plinth ? BLANK.slice() : o.walls !== undefined ? [o.walls, o.walls, o.walls, o.walls] : b.real ? realWallKinds(blk, b, p, shops) : wallKinds(b, p, shops, o));
+    for (const p of b.parts) p.faces = facesOf(p);
+    // On the relief every volume stands on its own street: its ground floor at the highest point of the ground
+    // along its street fronts (no front is ever buried; the party walls & yards behind may be), a windowless plinth
+    // down to the lowest point under it (nothing ever floats), and a long front that climbs more than a metre is
+    // cut into steps, each seated on its own (HOW_TO_IMPROVE.md §5.7)
+    const parts = relief ? stepParts(b.parts) : b.parts;
+    const partBase = new Map();
+    const partPlinth = new Map();
+    if (relief) {
+      const isFront = (p, side) => p.faces[SIDE_IDX[side]] <= WALL_KINDS.entry;
+      const frontHeights = (p) => {
+        const hs = [];
+        const C = corners(p.x0, p.x1, p.z0, p.z1); // [x0z0, x1z0, x1z1, x0z1] in the world
+        if (isFront(p, 'n')) hs.push(terrainY(C[0].x, C[0].z), terrainY(C[1].x, C[1].z));
+        if (isFront(p, 's')) hs.push(terrainY(C[3].x, C[3].z), terrainY(C[2].x, C[2].z));
+        if (isFront(p, 'w')) hs.push(terrainY(C[0].x, C[0].z), terrainY(C[3].x, C[3].z));
+        if (isFront(p, 'e')) hs.push(terrainY(C[1].x, C[1].z), terrainY(C[2].x, C[2].z));
+        return hs;
+      };
+      // every volume on its own ground (a Catastro record can spread the constructions of a rural parcel hundreds
+      // of metres apart): its street fronts, else the median under it; an upper volume takes the ground volume it
+      // stands on
+      const groundParts = parts.filter((p) => p.y0 <= EPS && !p.plinth);
+      for (const p of parts) {
+        const C = corners(p.x0, p.x1, p.z0, p.z1);
+        const [mx, mz] = toWorld((p.x0 + p.x1) * 0.5, (p.z0 + p.z1) * 0.5);
+        const under = [...C.map((c) => terrainY(c.x, c.z)), terrainY(mx, mz)];
+        partPlinth.set(p, Math.min(...under));
+        if (p.y0 > EPS) continue;
+        const hs = p.plinth ? [] : frontHeights(p);
+        const sorted = under.slice().sort((a, b) => a - b);
+        partBase.set(p, hs.length ? Math.max(...hs) : sorted[sorted.length >> 1]);
+      }
+      for (const p of parts) {
+        if (p.y0 <= EPS) continue;
+        const mx = (p.x0 + p.x1) * 0.5, mz = (p.z0 + p.z1) * 0.5;
+        const below = groundParts.find((g) => mx >= g.x0 - 0.5 && mx <= g.x1 + 0.5 && mz >= g.z0 - 0.5 && mz <= g.z1 + 0.5) || groundParts[0];
+        partBase.set(p, below ? partBase.get(below) : partPlinth.get(p));
+      }
+    }
     let top = null;
     for (const p of parts) {
       const w = p.x1 - p.x0;
       const d = p.z1 - p.z0;
       const h = p.y1 - p.y0;
-      if (p.plinth) p.faces = [WALL_KINDS.blankStone, WALL_KINDS.blankStone, WALL_KINDS.blankStone, WALL_KINDS.blankStone];
-      else p.faces = o.walls !== undefined ? [o.walls, o.walls, o.walls, o.walls] : b.real ? realWallKinds(blk, b, p, shops) : wallKinds(b, p, shops, o);
-      const box = place({ x: p.x0 + w * 0.5, y: p.y0 + h * 0.5, z: p.z0 + d * 0.5, w, h, d, faces: p.faces, tone });
+      baseY = relief ? partBase.get(p) : 0;
+      const box = place({ x: p.x0 + w * 0.5, y: p.y0 + h * 0.5, z: p.z0 + d * 0.5, w, h, d, faces: p.faces, tone, base: p.y0 });
       buckets[mat].push(box);
       pushCollider(p.x0, p.x1, p.z0, p.z1, p.y0, p.y1);
+      if (relief && p.y0 <= EPS) {
+        const drop = baseY - partPlinth.get(p);
+        seating.parts++;
+        const [wx, wz] = toWorld((p.x0 + p.x1) * 0.5, (p.z0 + p.z1) * 0.5);
+        const rear = Math.max(...corners(p.x0, p.x1, p.z0, p.z1).map((c) => terrainY(c.x, c.z))) - baseY;
+        if (rear > 2) { seating.rearBuriedOver2m++; noteWorst(seating.worstBuried, wx, wz, rear); }
+        if (drop > 3) noteWorst(seating.worstPlinths, wx, wz, drop);
+        if (drop > 0.25) {
+          // the plinth: a windowless box from the lowest point of the relief under the volume up to its ground floor
+          const ph = drop + 0.3;
+          buckets[mat].push(place({ x: p.x0 + w * 0.5, y: -ph + ph * 0.5, z: p.z0 + d * 0.5, w, h: ph, d, faces: BLANK, tone, base: -ph }));
+          pushCollider(p.x0, p.x1, p.z0, p.z1, -ph, 0);
+          seating.plinths++;
+          if (ph > 3) seating.plinthsOver3m++;
+          if (ph > seating.maxPlinth) seating.maxPlinth = ph;
+        }
+      }
       if (p.plinth) continue;
       const fp = { x0: p.x0, x1: p.x1, z0: p.z0, z1: p.z1, h: p.y1, tone };
       if (xf) {
@@ -885,7 +986,7 @@ function buildCityBlocks(scene) {
           const [nx, nz] = NORMAL[side];
           const cs = xf ? xf.cs : 1;
           const sn = xf ? xf.sn : 0;
-          blk.fronts.push({ ax, az, bx, bz, L, ox: nx * cs + nz * sn, oz: -nx * sn + nz * cs, alongX, ry: xf ? xf.th : 0, storey: Math.min(p.y1, b.ground ?? storey), box, side: SIDE_IDX[side] });
+          blk.fronts.push({ ax, az, bx, bz, L, ox: nx * cs + nz * sn, oz: -nx * sn + nz * cs, alongX, ry: xf ? xf.th : 0, storey: Math.min(p.y1, b.ground ?? storey), base: baseY, box, side: SIDE_IDX[side] });
         }
       }
     }
@@ -896,6 +997,7 @@ function buildCityBlocks(scene) {
       const ch = o.corniceH ?? 0.5;
       for (const p of parts) {
         if (p.plinth) continue;
+        if (relief) baseY = partBase.get(p);
         const x0 = p.x0 - corniceReach(b, p, 'w', 0.35);
         const x1 = p.x1 + corniceReach(b, p, 'e', 0.35);
         const z0 = p.z0 - corniceReach(b, p, 'n', 0.35);
@@ -912,11 +1014,13 @@ function buildCityBlocks(scene) {
       for (const p of parts) {
         if (p.plinth || p.y1 < top.y1 - EPS) continue;
         if (Math.min(p.x1 - p.x0, p.z1 - p.z0) > (o.maxRoofSpan ?? 16)) continue;
+        if (relief) baseY = partBase.get(p);
         pitchedRoof(p, pitchedKind, o.ridge ?? 'auto', o.eave ?? 0.3);
       }
     } else if (roof === 'saw') {
-      for (const p of parts) if (!p.plinth && p.y1 >= top.y1 - EPS && Math.min(p.x1 - p.x0, p.z1 - p.z0) >= 5) sawtoothRoof(p);
+      for (const p of parts) if (!p.plinth && p.y1 >= top.y1 - EPS && Math.min(p.x1 - p.x0, p.z1 - p.z0) >= 5) { if (relief) baseY = partBase.get(p); sawtoothRoof(p); }
     } else if (roof !== 'none') {
+      if (relief) baseY = partBase.get(top);
       const tw = rectW(top);
       const td = rectD(top);
       if (roof === 'mech') {
@@ -960,6 +1064,7 @@ function buildCityBlocks(scene) {
       const depth = o.balconyDepth ?? 0.9;
       for (const p of parts) {
         if (p.plinth || p.y0 > EPS) continue;
+        if (relief) baseY = partBase.get(p);
         const nf = Math.round((p.y1 - p.y0) / storey);
         if (nf < 2) continue;
         const longest = Math.max(p.x1 - p.x0, p.z1 - p.z0);
@@ -984,6 +1089,7 @@ function buildCityBlocks(scene) {
         }
       }
     }
+    baseY = 0;
     return true;
   }
 
@@ -1620,7 +1726,7 @@ function buildCityBlocks(scene) {
     const pz = fr.az + t * (fr.bz - fr.az);
     const sign = signs.length < SIGN_CAP ? signs.push({ name: s.name, kind: s.kind }) - 1 : -1;
     blk.awnings.push({
-      x: px + fr.ox * 0.9, y: fr.storey * 0.72, z: pz + fr.oz * 0.9, len, alongX: fr.alongX, ry: fr.ry, storey: fr.storey,
+      x: px + fr.ox * 0.9, y: fr.storey * 0.72 + fr.base, z: pz + fr.oz * 0.9, len, alongX: fr.alongX, ry: fr.ry, storey: fr.storey + fr.base,
       colorIdx: awningColorOf(s.name, s.kind), ox: fr.ox, oz: fr.oz, kind: s.kind, sign
     });
     fr.box.faces[fr.side] = WALL_KINDS.shop;
@@ -1711,9 +1817,10 @@ function buildCityBlocks(scene) {
   if (yardRects.length) {
     const yardInst = new THREE.InstancedMesh(unitBox, yardMat, yardRects.length);
     yardRects.forEach((r, i) => {
-      dummy.position.set((r.x0 + r.x1) * 0.5, 0.225, (r.z0 + r.z1) * 0.5);
+      // on the relief the slab reaches 2.5 m down, so a sloping yard shows a retaining wall rather than a floating edge
+      dummy.position.set((r.x0 + r.x1) * 0.5, relief ? terrainY((r.x0 + r.x1) * 0.5, (r.z0 + r.z1) * 0.5) + 0.25 - 1.25 : 0.225, (r.z0 + r.z1) * 0.5);
       dummy.rotation.set(0, r.ry || 0, 0);
-      dummy.scale.set(r.x1 - r.x0, 0.05, r.z1 - r.z0);
+      dummy.scale.set(r.x1 - r.x0, relief ? 2.5 : 0.05, r.z1 - r.z0);
       dummy.updateMatrix();
       yardInst.setMatrixAt(i, dummy.matrix);
     });
@@ -2130,6 +2237,7 @@ function buildCityBlocks(scene) {
   scene.add(group);
   return {
     group,
+    seating,
     colliders,
     quadtree,
     allBlocks,

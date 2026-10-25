@@ -2,6 +2,7 @@ import * as THREE from 'three/webgpu';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { LANDMARK_SITES, MODELLED_LANDMARKS, nearestRoads } from './city-config.js';
 import { createPreWarBuildingMaterial } from './tsl-materials.js';
+import { terrainY } from './terrain.js';
 
 // js/landmarks.js
 // Terrassa's landmarks, built from their real OpenStreetMap footprints (city-config.js LANDMARK_SITES: outline `ring`
@@ -201,10 +202,11 @@ function insetPoint(ring, p, inset) {
 // Geometry sink: everything is baked in world space into one geometry per material
 // ---------------------------------------------------------------------------------------------------------------------
 class Sink {
-  constructor() { this.buckets = new Map(); this.colliders = []; }
+  constructor() { this.buckets = new Map(); this.colliders = []; this.base = 0; } // base: the relief under the current landmark
   add(geo, mat, matrix = null) {
     let g = geo.index ? geo.toNonIndexed() : geo;
     if (matrix) g.applyMatrix4(matrix);
+    if (this.base) g.translate(0, this.base, 0);
     for (const k of Object.keys(g.attributes)) if (k !== 'position' && k !== 'normal' && k !== 'uv') g.deleteAttribute(k);
     if (!g.attributes.normal) g.computeVertexNormals();
     if (!g.attributes.uv) g.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(g.attributes.position.count * 2), 2));
@@ -212,7 +214,7 @@ class Sink {
     this.buckets.get(mat).push(g);
   }
   box(w, h, d, mat, matrix) { this.add(new THREE.BoxGeometry(w, h, d), mat, matrix); }
-  collide(minX, maxX, minZ, maxZ, maxY) { this.colliders.push({ minX, maxX, minZ, maxZ, maxY }); }
+  collide(minX, maxX, minZ, maxZ, maxY) { this.colliders.push(this.base ? { minX, maxX, minZ, maxZ, minY: this.base, maxY: maxY + this.base } : { minX, maxX, minZ, maxZ, maxY }); }
   /** Axis-aligned boxes tiling an outline (minus an optional hole) for the collision system */
   collideRing(ring, maxY, cell = 4, hole = null) {
     const b = bboxOf(ring);
@@ -1085,6 +1087,16 @@ function buildLandmarks(scene) {
     const s = LANDMARK_SITES[name];
     if (!s) continue;
     const ring = s.ring ? cleanRing(s.ring) : null;
+    // seated on the relief at the median height of its outline; a concrete plinth closes the gap down to the
+    // lowest point of the outline where the ground falls away
+    if (ring) {
+      // the ground floor at the high side of its outline (90th percentile: a stray vertex up a bank does not lift
+      // the whole building), a concrete plinth down to the lowest vertex
+      const ys = ring.map((p) => terrainY(p.x, p.z)).sort((p, q) => p - q);
+      sink.base = ys[Math.min(ys.length - 1, Math.floor(ys.length * 0.9))];
+      const drop = sink.base - ys[0];
+      if (drop > 0.3) sink.add(wallRing(ring, -drop - 0.5, 0), concreteDark);
+    } else sink.base = terrainY(s.x, s.z);
     if (s.kind === 'chimney' || /^Xemeneia/.test(name)) {
       chimney(sink, s.x, s.z, heightOf(s, 30), brick, brickDark, (s.h || 0) >= 60 || !!ring);
       continue;

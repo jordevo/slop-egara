@@ -1,6 +1,7 @@
 import * as THREE from 'three/webgpu';
 import { CROSSWALK } from './road-network.js';
 import { createRoadPaintMaterial } from './tsl-materials.js';
+import { terrainActive, terrainLattice, refineGeometry, surfaceY } from './terrain.js';
 
 // js/road-paint.js
 // Road markings generated from the drivable road network (js/road-network.js), so the paint matches where traffic
@@ -21,7 +22,10 @@ function buildRoadPaint(scene, network) {
   const lines = [];
   const bends = new Map();
 
-  // Flat strip w wide from a to b, with a dash pattern (period, duty cycle) running along it
+  // Flat strip w wide from a to b, with a dash pattern (period, duty cycle) running along it. The paint is laid flat
+  // and, over the relief, cut on the asphalt's own lattice and lifted onto it at the end (so it lies exactly on the
+  // deck's triangles and never fights them)
+  const relief = terrainActive();
   function strip(ax, az, bx, bz, w, col, period = 1, duty = 1, phase = 0, flow = 1) {
     const len = Math.hypot(bx - ax, bz - az);
     if (len < 0.05) return;
@@ -187,13 +191,20 @@ function buildRoadPaint(scene, network) {
   const normal = new Float32Array(position.length);
   for (let i = 1; i < normal.length; i += 3) normal[i] = 1;
 
-  const geometry = new THREE.BufferGeometry();
+  let geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(position, 3));
   geometry.setAttribute('normal', new THREE.BufferAttribute(normal, 3));
   geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
   geometry.setAttribute('side', new THREE.Float32BufferAttribute(side, 2));
   geometry.setAttribute('paint', new THREE.Float32BufferAttribute(paint, 3));
   geometry.setIndex(index);
+  if (relief) {
+    const lat = terrainLattice();
+    geometry = refineGeometry(geometry, lat.cell, { x0: lat.x0, z0: lat.z0 });
+    const pos = geometry.attributes.position.array;
+    for (let k = 0; k < pos.length; k += 3) pos[k + 1] += surfaceY(pos[k], pos[k + 2]);
+    geometry.attributes.position.needsUpdate = true;
+  }
 
   const mesh = new THREE.Mesh(geometry, createRoadPaintMaterial());
   mesh.name = 'RoadMarkings';

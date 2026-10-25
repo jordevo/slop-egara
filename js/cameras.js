@@ -1,5 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { CITY_LANDMARKS, LANDMARK_SITES, TELEPORT_LOCATIONS, SPAWN, STREET_INDEX, PARKS, pointInPoly } from './city-config.js';
+import { groundHeightAt } from './city-grid.js';
 
 // js/cameras.js
 // Multi-camera system supporting Third-Person Chase (with mouse/touch orbit + zoom),
@@ -270,11 +271,10 @@ class CameraSystem {
         const height = entity.chaseHeight * this.zoomMultiplier + Math.sin(this.orbitPitchOffset) * dist * 0.85;
         const horizDist = Math.cos(this.orbitPitchOffset) * dist + speedLag;
 
-        desiredPos.set(
-          entity.position.x - Math.sin(totalYaw) * horizDist,
-          Math.max(0.65, entity.position.y + height),
-          entity.position.z - Math.cos(totalYaw) * horizDist
-        );
+        // the floor is the ground under the camera (the relief: city-grid.js groundHeightAt), never an absolute height
+        const camX = entity.position.x - Math.sin(totalYaw) * horizDist;
+        const camZ = entity.position.z - Math.cos(totalYaw) * horizDist;
+        desiredPos.set(camX, Math.max(groundHeightAt(camX, camZ) + 0.65, entity.position.y + height), camZ);
 
         const lookUpBias = entity.type === 'helicopter' ? 0.2 : (entity.type === 'car' ? 0.52 : 1.55);
         desiredLook.set(
@@ -290,11 +290,9 @@ class CameraSystem {
         const backDist = (entity.type === 'car' ? 3.6 : (entity.type === 'helicopter' ? 8.5 : 2.8)) + speedLag;
         const lowY = entity.type === 'helicopter' ? entity.position.y + 1.2 : entity.position.y + 0.92;
 
-        desiredPos.set(
-          entity.position.x - Math.sin(entity.heading) * backDist + Math.cos(entity.heading) * sideOffset,
-          Math.max(0.55, lowY),
-          entity.position.z - Math.cos(entity.heading) * backDist - Math.sin(entity.heading) * sideOffset
-        );
+        const actX = entity.position.x - Math.sin(entity.heading) * backDist + Math.cos(entity.heading) * sideOffset;
+        const actZ = entity.position.z - Math.cos(entity.heading) * backDist - Math.sin(entity.heading) * sideOffset;
+        desiredPos.set(actX, Math.max(groundHeightAt(actX, actZ) + 0.55, lowY), actZ);
         desiredLook.set(
           entity.position.x + Math.sin(entity.heading) * 3.2,
           entity.position.y + 1.05,
@@ -432,7 +430,8 @@ class CameraSystem {
       this.followLookOffset.lerp(desiredLook.sub(entity.position), k);
       this.currentPos.set(entity.position.x, this.followBaseY, entity.position.z).add(this.followOffset);
       this.currentLookAt.set(entity.position.x, this.followBaseY, entity.position.z).add(this.followLookOffset);
-      this.currentPos.y = Math.max(0.55, this.currentPos.y);
+      // never below the ground under the camera (the relief: city-grid.js groundHeightAt), nor the roadway itself
+      this.currentPos.y = Math.max(groundHeightAt(this.currentPos.x, this.currentPos.z) + 0.55, this.currentPos.y);
     } else {
       this.followEntity = null;
       const k = 1 - Math.exp(-dt * 8.5);

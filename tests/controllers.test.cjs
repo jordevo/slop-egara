@@ -38,7 +38,8 @@ function keyboardHarness(nyc = {}) {
       './actor-models.js': {},
       './pedestrians.js': {},
       './vehicle-lights.js': {},
-      './city-grid.js': { groundHeightAt: () => 0 }
+      './city-grid.js': { groundHeightAt: () => 0, roadHeightAt: () => 0 },
+      './terrain.js': { terrainY: () => 0, terrainGradient: (x, z, out = { gx: 0, gz: 0 }) => { out.gx = 0; out.gz = 0; return out; } }
     }
   });
   // Exercise the production event handlers without constructing the scene's 3D models.

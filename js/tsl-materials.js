@@ -396,6 +396,7 @@ function facadeCell(windowWidth, floorHeight, boxLocal, cornerPier = 0) {
   let wallH = float(1.0);
   let fromTop = float(0.0);
   let boxSeed = float(0.0);
+  let boxBottom = null; // box-local: height over the building's own ground
 
   if (boxLocal) {
     const box = attribute('box', 'vec4'); // width, height, depth, seed (+ the building's tone in its fraction)
@@ -419,6 +420,9 @@ function facadeCell(windowWidth, floorHeight, boxLocal, cornerPier = 0) {
     wallS = mix(along, float(1.0).sub(along), flip).mul(wallWidth);
     wallH = box.y;
     fromTop = float(0.5).sub(positionGeometry.y).mul(box.y);
+    // storeys are counted from the building's own ground (per-instance `base`: the box bottom over it), so a
+    // building seated on the relief keeps its window rows where its floors are
+    boxBottom = attribute('base', 'float').add(positionGeometry.y.add(0.5).mul(box.y));
     if (cornerPier > 0) {
       const pier = min(float(cornerPier), wallWidth.mul(0.2));
       const inner = wallWidth.sub(pier.mul(2.0));
@@ -437,7 +441,7 @@ function facadeCell(windowWidth, floorHeight, boxLocal, cornerPier = 0) {
     uCoord = gridU.mul(bayWidth);
   }
 
-  const vCoord = positionWorld.y;
+  const vCoord = boxBottom || positionWorld.y;
   const gridV = vCoord.div(floorHeight);
   const cellId = vec2(floor(gridU), floor(gridV));
   const cellUV = vec2(fract(gridU), fract(gridV));
@@ -1065,8 +1069,10 @@ function createFacadeBoxes(material, boxes) {
   const geometry = new THREE.BoxGeometry(1, 1, 1);
   const box = new THREE.InstancedBufferAttribute(new Float32Array(boxes.length * 4), 4);
   const faces = new THREE.InstancedBufferAttribute(new Float32Array(boxes.length * 4), 4);
+  const base = new THREE.InstancedBufferAttribute(new Float32Array(boxes.length), 1); // box bottom over the building's ground
   geometry.setAttribute('box', box);
   geometry.setAttribute('faces', faces);
+  geometry.setAttribute('base', base);
 
   const mesh = new THREE.InstancedMesh(geometry, material, boxes.length);
   const matrix = new THREE.Matrix4();
@@ -1079,6 +1085,7 @@ function createFacadeBoxes(material, boxes) {
     else mesh.setMatrixAt(i, matrix.makeScale(b.w, b.h, b.d).setPosition(b.x, b.y, b.z));
     box.setXYZW(i, b.w, b.h, b.d, ((i * 29) % 1000) + 0.1 + 0.8 * (b.tone ?? 0.5));
     if (b.faces) faces.setXYZW(i, b.faces[0], b.faces[1], b.faces[2], b.faces[3]);
+    base.setX(i, b.base ?? b.y - b.h * 0.5);
   });
   return mesh;
 }

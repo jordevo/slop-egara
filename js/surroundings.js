@@ -26,6 +26,7 @@ import {
 } from 'three/tsl';
 import { cityUniforms } from './tsl-materials.js';
 import { LAND_RING, pointInPoly } from './city-config.js';
+import { terrainActive, terrainY } from './terrain.js';
 import { GEO } from './terrassa-geodata.js';
 
 // js/surroundings.js
@@ -240,9 +241,12 @@ function mountainHeight(x, z) {
 }
 // The terrain model at any point (m above the city): mountains + massif base + noise, flattened in and around the
 // detailed area and towards the edge of the grid
+// With the real relief (terrain.js) the detailed area and its margin take the measured heights; beyond the data the
+// border height carries on (terrainY clamps) and the procedural mountains rise on top of it
 function terrainModel(x, z) {
   const dr = distToDetail(x, z);
-  if (dr <= 0) return 0;
+  const real = terrainActive() ? terrainY(x, z) : 0;
+  if (dr <= 0) return real;
   // flat for the first cell outside the detailed area too, so no triangle straddling its edge rises over the deck
   const mask = smooth01((dr - T_CELL * 1.2) / DETAIL_BLEND);
   const far = 1 - smooth01((Math.hypot(x, z) - HORIZON_FADE0) / (HORIZON_FADE1 - HORIZON_FADE0));
@@ -250,17 +254,20 @@ function terrainModel(x, z) {
   // Ridged detail on the massif (gullies & spurs), only a gentle roll on the plain
   const n = fbm2(x / 1400 + 7.3, z / 1400 + 2.1, 4) - 0.5;
   h += n * 70 * Math.min(1, h / 180) + n * 10;
-  return Math.max(0, h) * mask * far;
+  return (real + Math.max(0, h) * mask) * far;
 }
 
-const TERRAIN = (() => {
+// The lattice is sampled on first use (not at import): the real relief is fetched after the modules load
+let TERRAIN = null;
+function terrainLattice() {
+  if (TERRAIN) return TERRAIN;
   const h = new Float32Array(T_N * T_N);
   for (let j = 0; j < T_N; j++) {
     const z = -T_HALF + j * T_CELL;
     for (let i = 0; i < T_N; i++) h[j * T_N + i] = terrainModel(-T_HALF + i * T_CELL, z);
   }
-  return h;
-})();
+  return (TERRAIN = h);
+}
 
 /**
  * Terrain height (world y) at (x, z): the surface of the rendered mesh (its triangles, so roads and trees placed with
@@ -270,6 +277,7 @@ function terrainHeightAt(x, z) {
   const fx = (x + T_HALF) / T_CELL;
   const fz = (z + T_HALF) / T_CELL;
   if (fx < 0 || fz < 0 || fx >= T_N - 1 || fz >= T_N - 1) return 0;
+  const TERRAIN = terrainLattice();
   const i = Math.floor(fx);
   const j = Math.floor(fz);
   const u = fx - i;
@@ -392,6 +400,8 @@ function groundColour(x, z, h, slope) {
 
 function buildGroundGeometry() {
   const n = T_N;
+  const TERRAIN = terrainLattice();
+  const relief = terrainActive();
   const pos = new Float32Array(n * n * 3);
   const col = new Float32Array(n * n * 3);
   for (let j = 0; j < n; j++) {
@@ -401,7 +411,9 @@ function buildGroundGeometry() {
       const k = j * n + i;
       const h = TERRAIN[k];
       pos[k * 3] = x;
-      pos[k * 3 + 1] = h > 0.05 ? h : -0.05; // the flat plain sits just under city-grid's deck (y = 0)
+      // the flat plain sits just under city-grid's deck (y = 0); with the relief the deck is a heightfield and the
+      // cells under it are left out below
+      pos[k * 3 + 1] = relief ? h - 0.3 : h > 0.05 ? h : -0.05;
       pos[k * 3 + 2] = z;
       // slope from the neighbouring samples (central differences, clamped at the border)
       const hL = TERRAIN[j * n + Math.max(0, i - 1)];
@@ -409,7 +421,8 @@ function buildGroundGeometry() {
       const hU = TERRAIN[Math.max(0, j - 1) * n + i];
       const hD = TERRAIN[Math.min(n - 1, j + 1) * n + i];
       const slope = Math.hypot((hR - hL) / (2 * T_CELL), (hD - hU) / (2 * T_CELL));
-      const c = groundColour(x, z, h, slope);
+      // coloured by the height over the plain around the city, not over the Plaça Vella
+      const c = groundColour(x, z, relief ? h - terrainY(x, z) : h, slope);
       col[k * 3] = toLinear(c[0]);
       col[k * 3 + 1] = toLinear(c[1]);
       col[k * 3 + 2] = toLinear(c[2]);
@@ -419,6 +432,11 @@ function buildGroundGeometry() {
   let o = 0;
   for (let j = 0; j < n - 1; j++) {
     for (let i = 0; i < n - 1; i++) {
+      if (relief) {
+        // a cell wholly under the city's deck is not drawn (the coarse lattice would cut through the heightfield)
+        const x0 = -T_HALF + i * T_CELL, z0 = -T_HALF + j * T_CELL;
+        if (distToDetail(x0, z0) < -2 && distToDetail(x0 + T_CELL, z0) < -2 && distToDetail(x0, z0 + T_CELL) < -2 && distToDetail(x0 + T_CELL, z0 + T_CELL) < -2) continue;
+      }
       const a = j * n + i;
       const b = a + 1;
       const d = a + n;
@@ -1102,6 +1120,7 @@ function createFarTreeMaterial() {
 function generateForestSites() {
   const rand = mulberry32(7331);
   const sites = []; // [x, y, z, scale, pine (1) / oak (0)]
+  const TERRAIN = terrainLattice();
   for (let j = 1; j < T_N - 1; j++) {
     const z0 = -T_HALF + j * T_CELL;
     for (let i = 1; i < T_N - 1; i++) {

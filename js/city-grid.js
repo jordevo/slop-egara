@@ -10,8 +10,10 @@ import {
   PARKS,
   LANDUSE,
   WATERWAYS,
-  RAIL_LINES
+  RAIL_LINES,
+  FEATURES
 } from './city-config.js';
+import { terrainActive, terrainY, terrainLattice, drapeGeometry, latticeCapGeometry, buildTerrainTiles, bridgeAt, bridgeList, deckY } from './terrain.js';
 import {
   createRoadSurfaceMaterial,
   createSidewalkMaterial,
@@ -338,6 +340,124 @@ function buildFenceStripGeometry(segments, y0, h) {
   return g;
 }
 
+/**
+ * A kerb round a closed outline: the outer face from y0 up to y1 and a flat strip `w` wide on top, turned inward, with
+ * a wedge at every corner so the strip stays closed. Nothing underneath or inside (hidden by the deck & the slab).
+ */
+function buildKerbGeometry(pts, y0, y1, w = 0.25) {
+  const n = pts.length;
+  const s = polygonArea(pts) > 0 ? 1 : -1;
+  // inward normal of edge i; checked against the polygon on the longest edge, flipped if it points out
+  const normal = (i, flip) => {
+    const a = pts[i], b = pts[(i + 1) % n];
+    const len = Math.hypot(b.x - a.x, b.z - a.z) || 1;
+    return [(flip * -s * (b.z - a.z)) / len, (flip * s * (b.x - a.x)) / len, len];
+  };
+  let longest = 0;
+  for (let i = 0; i < n; i++) if (normal(i, 1)[2] > normal(longest, 1)[2]) longest = i;
+  const [nx0, nz0] = normal(longest, 1);
+  const a0 = pts[longest], b0 = pts[(longest + 1) % n];
+  const flip = pointInPolygonXZ(pts, (a0.x + b0.x) * 0.5 + nx0 * 0.4, (a0.z + b0.z) * 0.5 + nz0 * 0.4) ? 1 : -1;
+  const pos = [], nor = [], uvs = [];
+  const tri = (p, q, r, nrm) => {
+    for (const v of [p, q, r]) { pos.push(v[0], v[1], v[2]); nor.push(nrm[0], nrm[1], nrm[2]); uvs.push(v[0] * 0.5, v[2] * 0.5); }
+  };
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    const [nx, nz, len] = normal(i, flip);
+    if (len < 0.05) continue;
+    // outer wall, facing out
+    const A0 = [a.x, y0, a.z], B0 = [b.x, y0, b.z], A1 = [a.x, y1, a.z], B1 = [b.x, y1, b.z];
+    const out = [-nx, 0, -nz];
+    // wound so the face points along `out` (seen from outside, counter-clockwise)
+    const cross = (B0[0] - A0[0]) * out[2] - (B0[2] - A0[2]) * out[0];
+    if (cross < 0) { tri(A0, B0, B1, out); tri(A0, B1, A1, out); } else { tri(A0, B1, B0, out); tri(A0, A1, B1, out); }
+    // top strip
+    const Ai = [a.x + nx * w, y1, a.z + nz * w], Bi = [b.x + nx * w, y1, b.z + nz * w];
+    const up = [0, 1, 0];
+    const upCross = (B1[0] - A1[0]) * (Ai[2] - A1[2]) - (B1[2] - A1[2]) * (Ai[0] - A1[0]); // (x, z) orientation: +y faces need (x, -z) ccw
+    if (upCross > 0) { tri(A1, Bi, B1, up); tri(A1, Ai, Bi, up); } else { tri(A1, B1, Bi, up); tri(A1, Bi, Ai, up); }
+    // corner wedge at b between this strip's inner corner and the next edge's
+    const [nnx, nnz] = normal((i + 1) % n, flip);
+    const Bn = [b.x + nnx * w, y1, b.z + nnz * w];
+    const wedge = (Bi[0] - B1[0]) * (Bn[2] - B1[2]) - (Bi[2] - B1[2]) * (Bn[0] - B1[0]);
+    if (Math.abs(wedge) > 1e-6) { if (wedge > 0) tri(B1, Bn, Bi, up); else tri(B1, Bi, Bn, up); }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  return g;
+}
+
+/**
+ * A bridge deck along its link: a 0.9 m thick slab the width of the carriageway plus both walks, the walks raised
+ * 0.15 m, parapets 1.1 m high & 0.3 m thick on both edges, every vertex at the deck's own height (terrain.js deckY).
+ * Returns { road (asphalt top), deck (slab sides & underside), walks, parapets, rails: [[ax, az, bx, bz, y]] } or null.
+ */
+function buildBridgeGeometry(b) {
+  const n = b.pts.length;
+  if (n < 2 || b.len < 2) return null;
+  const halfRoad = b.width * 0.5;
+  const halfAll = b.half;
+  const THICK = 0.9, WALK = 0.15, PARAPET = 1.1, PT = 0.3;
+  // normals at each polyline point (mitred), like buildRibbonGeometry
+  const N = [];
+  for (let i = 0; i < n; i++) {
+    const p = b.pts[i], a = b.pts[Math.max(0, i - 1)], c = b.pts[Math.min(n - 1, i + 1)];
+    const L = Math.hypot(c.x - a.x, c.z - a.z) || 1;
+    N.push([-(c.z - a.z) / L, (c.x - a.x) / L]);
+  }
+  const Y = b.s.map((d) => deckY(b, d));
+  const road = [], roadN = [], deck = [], deckN = [], walks = [], walksN = [], par = [], parN = [], rails = [];
+  const quad = (pos, nor, p0, p1, p2, p3, nrm) => {
+    // p0 p1 p2 p3 counter-clockwise seen from the normal side
+    for (const v of [p0, p1, p2, p0, p2, p3]) { pos.push(v[0], v[1], v[2]); nor.push(nrm[0], nrm[1], nrm[2]); }
+  };
+  for (let i = 0; i + 1 < n; i++) {
+    const p = b.pts[i], q = b.pts[i + 1];
+    const [nx0, nz0] = N[i], [nx1, nz1] = N[i + 1];
+    const y0 = Y[i], y1 = Y[i + 1];
+    const P = (o, k, y) => (k === 0 ? [p.x + nx0 * o, y, p.z + nz0 * o] : [q.x + nx1 * o, y, q.z + nz1 * o]);
+    // deck top (carriageway between the walks), underside, and the two sides
+    quad(road, roadN, P(-halfRoad, 0, y0), P(-halfRoad, 1, y1), P(halfRoad, 1, y1), P(halfRoad, 0, y0), [0, 1, 0]);
+    quad(deck, deckN, P(halfAll, 0, y0 - THICK), P(halfAll, 1, y1 - THICK), P(-halfAll, 1, y1 - THICK), P(-halfAll, 0, y0 - THICK), [0, -1, 0]);
+    for (const sgn of [-1, 1]) {
+      const o = sgn * halfAll;
+      const a0 = P(o, 0, y0 - THICK), a1 = P(o, 1, y1 - THICK), a2 = P(o, 1, y1 + WALK), a3 = P(o, 0, y0 + WALK);
+      if (sgn > 0) quad(deck, deckN, a0, a1, a2, a3, [nx0 * sgn, 0, nz0 * sgn]); else quad(deck, deckN, a3, a2, a1, a0, [nx0 * sgn, 0, nz0 * sgn]);
+      // raised walk (top + kerb face towards the road)
+      const w0 = sgn * halfRoad, w1 = sgn * (halfAll - PT);
+      if (sgn > 0) {
+        quad(walks, walksN, P(w0, 0, y0 + WALK), P(w0, 1, y1 + WALK), P(w1, 1, y1 + WALK), P(w1, 0, y0 + WALK), [0, 1, 0]);
+        quad(walks, walksN, P(w0, 0, y0), P(w0, 1, y1), P(w0, 1, y1 + WALK), P(w0, 0, y0 + WALK), [-nx0, 0, -nz0]);
+      } else {
+        quad(walks, walksN, P(w1, 0, y0 + WALK), P(w1, 1, y1 + WALK), P(w0, 1, y1 + WALK), P(w0, 0, y0 + WALK), [0, 1, 0]);
+        quad(walks, walksN, P(w0, 0, y0 + WALK), P(w0, 1, y1 + WALK), P(w0, 1, y1), P(w0, 0, y0), [nx0, 0, nz0]);
+      }
+      // parapet: a box along the edge
+      const e0 = sgn * (halfAll - PT), e1 = sgn * halfAll;
+      const top0 = y0 + WALK + PARAPET, top1 = y1 + WALK + PARAPET;
+      // top, inner face (down to the walk) and outer face (down to the walk: the deck's side carries on below it)
+      quad(par, parN, P(e0, 0, top0), P(e0, 1, top1), P(e1, 1, top1), P(e1, 0, top0), [0, 1, 0]);
+      quad(par, parN, P(e0, 0, y0 + WALK), P(e0, 1, y1 + WALK), P(e0, 1, top1), P(e0, 0, top0), [-nx0 * sgn, 0, -nz0 * sgn]);
+      quad(par, parN, P(e1, 0, top0), P(e1, 1, top1), P(e1, 1, y1 + WALK), P(e1, 0, y0 + WALK), [nx0 * sgn, 0, nz0 * sgn]);
+      const r0 = P(sgn * (halfAll - PT * 0.5), 0, 0), r1 = P(sgn * (halfAll - PT * 0.5), 1, 0);
+      rails.push([r0[0], r0[2], r1[0], r1[2], Math.min(y0, y1) + WALK]);
+    }
+  }
+  const make = (pos, nor) => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+    const uv = new Float32Array((pos.length / 3) * 2);
+    for (let k = 0; k < pos.length / 3; k++) { uv[k * 2] = pos[k * 3] * 0.5; uv[k * 2 + 1] = pos[k * 3 + 2] * 0.5; }
+    g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+    return g;
+  };
+  return { road: make(road, roadN), deck: make(deck, deckN), walks: make(walks, walksN), parapets: make(par, parN), rails };
+}
+
 /** Closed polygon outline -> fence segments, skipping the stretches within `gapR` of any gate point {x, z}. */
 function polygonFenceSegments(pts, gates = [], gapR = 2.0, step = 1.0) {
   const segs = [];
@@ -518,7 +638,7 @@ function buildCityGrid(scene) {
   const addFootprint = (x, z, w, d) => footprints.push({ minX: x - w / 2, maxX: x + w / 2, minZ: z - d / 2, maxZ: z + d / 2 });
   // Player colliders: the parapets of the canalised rieres (oriented boxes, one per wall edge)
   const colliders = [];
-  const addWallCollider = (ax, az, bx, bz, h = 1.2) => {
+  const addWallCollider = (ax, az, bx, bz, h = 1.2, y0 = 0) => {
     const len = Math.hypot(bx - ax, bz - az);
     if (len < 0.3) return;
     const ux = (bx - ax) / len, uz = (bz - az) / len;
@@ -526,7 +646,7 @@ function buildCityGrid(scene) {
     const hx = len * 0.5 + 0.2, hz = 0.35;
     const ex = Math.abs(ux) * hx + Math.abs(uz) * hz;
     const ez = Math.abs(uz) * hx + Math.abs(ux) * hz;
-    colliders.push({ minX: cx - ex, maxX: cx + ex, minZ: cz - ez, maxZ: cz + ez, minY: 0, maxY: h, obb: { cx, cz, hx, hz, cs: ux, sn: -uz } });
+    colliders.push({ minX: cx - ex, maxX: cx + ex, minZ: cz - ez, maxZ: cz + ez, minY: y0, maxY: y0 + h, obb: { cx, cz, hx, hz, cs: ux, sn: -uz } });
   };
 
   // ---- Shared materials -----------------------------------------------------------------------------------------
@@ -554,11 +674,20 @@ function buildCityGrid(scene) {
   const railMat = new THREE.MeshStandardNodeMaterial({ color: 0x5a5753, roughness: 0.35, metalness: 0.8 });
   const timberMat = new THREE.MeshStandardNodeMaterial({ color: 0x6e4f33, roughness: 0.8 });
   const ironMat = new THREE.MeshStandardNodeMaterial({ color: 0x23272a, roughness: 0.5, metalness: 0.6 });
+  for (const [name, m] of Object.entries({ roadMat, sidewalkMat, curbMat, lawnMat, meadowMat, pavingMat, waterMat, fenceMat, wallMat, grateMat, glowMat, graniteMat, hedgeMat, sauloMat, woodMat, scrubMat, farmMat, ballastMat, earthMat, mudMat, concreteMat, railMat, timberMat, ironMat })) m.name = name;
 
   // ---- Shared accumulators (merged / instanced at the end) -----------------------------------------------------
   const geos = new Map(); // material -> [geometry] merged in batches of 400
-  const addGeo = (mat, geo) => {
+  // With the relief on (terrain.js), every ground geometry is refined & draped over it as it is accumulated: slabs,
+  // kerbs, banks, fences, walks... are authored flat (y relative to the roadway) and lifted here, vertex by vertex
+  const relief = terrainActive();
+  const KERB_BOTTOM = relief ? -0.4 : 0.0; // kerbs reach below the deck on a slope so no slit opens between them
+  // cut along the relief's own lattice (the deck below is drawn on it), bottom caps dropped
+  const LATTICE = terrainLattice() || { x0: 0, z0: 0, cell: 10 };
+  const DRAPE_OPTS = { dropDown: true, x0: LATTICE.x0, z0: LATTICE.z0 };
+  const addGeo = (mat, geo, raw = false) => {
     if (!geo) return;
+    if (relief && !raw) geo = drapeGeometry(geo, geo.userData.latticeAligned ? 0 : LATTICE.cell, geo.userData.noDiag ? { ...DRAPE_OPTS, noDiag: true } : DRAPE_OPTS);
     let list = geos.get(mat);
     if (!list) geos.set(mat, (list = []));
     list.push(geo);
@@ -569,9 +698,29 @@ function buildCityGrid(scene) {
   };
   const addFlat = (mat, pts, y, holes = [], style = -1) => {
     if (!pts || pts.length < 3) return;
-    const g = createFlatPolygonMesh(pts, y, mat, true, holes).geometry;
+    const g = (relief && latticeCapGeometry(pts, holes, y, LATTICE, THREE.ShapeUtils.triangulateShape)) || createFlatPolygonMesh(pts, y, mat, true, holes).geometry;
     if (style >= 0) setPavingStyle(g, style);
     addGeo(mat, g);
+  };
+  // The raised slabs (sidewalks, walks, paving) and the kerbs round them. Flat, the slabs are thin extrusions and the
+  // kerb a full extrusion of the outline; on the relief the slab is a single draped cap (its sides sit behind the
+  // kerb) and the kerb an outer wall with a 0.25 m top strip (no hidden inner wall, no bottom), both cut on the deck
+  // lattice: a fraction of the triangles for the same picture
+  const addSlab = (mat, pts, holes = [], style = -1) => {
+    if (!pts || pts.length < 3) return;
+    if (relief) addFlat(mat, pts, SW_TOP + 0.005, holes, style);
+    else {
+      const g = createExtrudedPolygonMesh(pts, 0.03, SW_TOP - 0.03 + 0.005, mat, true, false, holes).geometry;
+      if (style >= 0) setPavingStyle(g, style);
+      addGeo(mat, g);
+    }
+  };
+  const addKerb = (poly, holes = []) => {
+    if (!poly || poly.length < 3) return;
+    if (!relief) { addExtruded(curbMat, poly, 0.0, SW_TOP, holes); return; }
+    const g = buildKerbGeometry(poly, KERB_BOTTOM, SW_TOP, 0.25);
+    g.userData.noDiag = true; // a 0.25 m strip: the deck's diagonals add nothing
+    addGeo(curbMat, g);
   };
   const addRibbon = (mat, pts, w, y, style = -1) => {
     const g = buildRibbonGeometry(pts, w, y);
@@ -583,16 +732,17 @@ function buildCityGrid(scene) {
   const lampSpots = []; // [x, y, z] park lamps (post + globe + light pool)
   const benchMatrices = [];
   const grateSpots = []; // [x, y, z] tree grates in the squares
-  const addLamp = (x, y, z) => { lampSpots.push([x, y, z]); addFootprint(x, z, 0.5, 0.5); };
+  const lift = relief ? (x, z) => terrainY(x, z) : () => 0;
+  const addLamp = (x, y, z) => { lampSpots.push([x, y + lift(x, z), z]); addFootprint(x, z, 0.5, 0.5); };
   const addBench = (x, y, z, rotY) => {
-    dummy.position.set(x, y, z);
+    dummy.position.set(x, y + lift(x, z), z);
     dummy.rotation.set(0, rotY, 0);
     dummy.scale.set(1, 1, 1);
     dummy.updateMatrix();
     benchMatrices.push(dummy.matrix.clone());
     addFootprint(x, z, 1.9, 0.7);
   };
-  const addTree = (x, y, z, scale, species, extra) => treeSites.push(extra ? { x, y, z, scale, species, ...extra } : { x, y, z, scale, species });
+  const addTree = (x, y, z, scale, species, extra) => { y += lift(x, z); treeSites.push(extra ? { x, y, z, scale, species, lifted: relief, ...extra } : { x, y, z, scale, species, lifted: relief }); };
 
   // Benches (backs to the bed coping, facing the walk) & lampposts along the edges of a lawn bed
   function lineBedEdges(bed, y, benchStep = 9.0) {
@@ -660,7 +810,9 @@ function buildCityGrid(scene) {
   const deckHoles = [];
   const sunkParkBlocks = [];
   const waterBlocks = [];
-  for (const b of BLOCKS) {
+  // With the real relief the torrent of Vallparadís and the rieres are already in the elevation model: no synthetic
+  // excavation (the sunk parks become ordinary parks on the valley floor, the channels silted beds on the terrain)
+  for (const b of relief ? [] : BLOCKS) {
     if (!b.open) continue;
     const bb = polygonBounds(b.poly);
     if (b.cls === LAND_CLASS.WATER && b.area > 300 && Math.min(bb.w, bb.d) > 4) {
@@ -671,9 +823,46 @@ function buildCityGrid(scene) {
       if (hole) { sunkParkBlocks.push(b); deckHoles.push(hole); }
     }
   }
-  const deck = createFlatPolygonMesh(LAND_RING, 0.0, roadMat, true, deckHoles);
-  deck.name = 'AsphaltDeck';
-  group.add(deck);
+  if (relief) {
+    // The deck as a heightfield: the relief sampled on a grid, in tiles; plus a skirt down its outer edge so no gap
+    // shows against the coarser regional ground (surroundings.js) where the two meet
+    const tiles = buildTerrainTiles(WORLD_BOUNDS, LATTICE.cell, FEATURES.terrainTile, 0.0);
+    for (const t of tiles) {
+      const mesh = new THREE.Mesh(t.geometry, roadMat);
+      mesh.name = 'AsphaltDeck';
+      mesh.receiveShadow = true;
+      group.add(mesh);
+    }
+    const skirtSegs = [];
+    const corners = [[WORLD_BOUNDS.minX, WORLD_BOUNDS.minZ], [WORLD_BOUNDS.maxX, WORLD_BOUNDS.minZ], [WORLD_BOUNDS.maxX, WORLD_BOUNDS.maxZ], [WORLD_BOUNDS.minX, WORLD_BOUNDS.maxZ]];
+    for (let i = 0; i < 4; i++) {
+      const [ax, az] = corners[i], [bx, bz] = corners[(i + 1) % 4];
+      const n = Math.ceil(Math.hypot(bx - ax, bz - az) / LATTICE.cell);
+      for (let k = 0; k < n; k++) skirtSegs.push([ax + (bx - ax) * k / n, az + (bz - az) * k / n, ax + (bx - ax) * (k + 1) / n, az + (bz - az) * (k + 1) / n]);
+    }
+    const skirt = new THREE.Mesh(drapeGeometry(buildFenceStripGeometry(skirtSegs, -30, 30), 0), concreteMat);
+    skirt.name = 'DeckSkirt';
+    group.add(skirt);
+    // The bridges: straight decks between their junction heights (terrain.js bridge table) over the relief, with
+    // 2.4 m raised walks and 1.1 m parapets (colliders) either side. Not draped: they are the one thing that is not
+    // the ground. Traffic, pedestrians and the player read them through groundHeightAt() / bridgeAt()
+    let bridgeCount = 0;
+    for (const b of bridgeList()) {
+      const g = buildBridgeGeometry(b);
+      if (!g) continue;
+      addGeo(roadMat, g.road, true); // the carriageway: the same asphalt as the streets
+      addGeo(concreteMat, g.deck, true);
+      addGeo(sidewalkMat, g.walks, true);
+      addGeo(concreteMat, g.parapets, true);
+      for (const [ax, az, bx, bz, y] of g.rails) addWallCollider(ax, az, bx, bz, 1.2, y);
+      bridgeCount++;
+    }
+    console.info(`[cityGrid] relief on: ${tiles.length} deck tiles of ${FEATURES.terrainTile} m, ${LATTICE.cell} m cells, ${bridgeCount} bridge decks`);
+  } else {
+    const deck = createFlatPolygonMesh(LAND_RING, 0.0, roadMat, true, deckHoles);
+    deck.name = 'AsphaltDeck';
+    group.add(deck);
+  }
 
   // =========================================================================
   // 3.2 RAISED SIDEWALKS & KERBS on every built curb island (city-config.js BLOCKS: the real islands between the
@@ -688,18 +877,18 @@ function buildCityGrid(scene) {
     const poly = cleanPolygon(b.poly);
     if (poly.length < 3) continue;
     blockOutlines.push({ block: b, poly });
-    addExtruded(curbMat, poly, 0.0, SW_TOP);
     const inner = offsetPolygonInward(poly, 0.25);
+    addKerb(poly);
     if (!inner) continue;
     const parking = b.cls === LAND_CLASS.PARKING && b.clsShare >= 0.5 && !b.median;
     if (parking) {
       // sidewalk ring around the car park, lamps on a grid inside it
       const inside = offsetPolygonInward(poly, 2.6);
-      addExtruded(sidewalkMat, inner, 0.03, SW_TOP - 0.03 + 0.005, inside ? [inside] : []);
+      addSlab(sidewalkMat, inner, inside ? [inside] : []);
       if (inside) scatterInPolygon(inside, 26, 3, 0, (x, z) => addLamp(x, 0.0, z));
       continue;
     }
-    addExtruded(sidewalkMat, inner, 0.03, SW_TOP - 0.03 + 0.005);
+    addSlab(sidewalkMat, inner);
     if (b.median) {
       const bb = polygonBounds(poly);
       const narrow = Math.min(bb.w, bb.d);
@@ -722,10 +911,10 @@ function buildCityGrid(scene) {
   function buildParkBlock(b, poly) {
     const bb = polygonBounds(poly);
     const narrow = Math.min(bb.w, bb.d);
-    addExtruded(curbMat, poly, 0.0, SW_TOP);
+    addKerb(poly);
     const walk = offsetPolygonInward(poly, 0.25);
     if (!walk) return;
-    addExtruded(sauloMat, walk, 0.03, SW_TOP - 0.03 + 0.005);
+    addSlab(sauloMat, walk);
     if (b.area < 500 || narrow < 9) {
       // a pocket garden: a few trees in the sauló and a bench
       scatterInPolygon(walk, 7, 2.2, 0.35, (x, z, r, r2) => addTree(x, SW_TOP, z, 0.75 + r2 * 0.3, parkSpecies(r)));
@@ -759,8 +948,8 @@ function buildCityGrid(scene) {
     const floor = offsetPolygonInward(poly, bankW);
     if (!kerbIn || !walkIn || !floor) { buildParkBlock(b, poly); return; }
     sunkBlocks.set(b.id, { depth, walk: walkW, bank: bankW });
-    addExtruded(curbMat, poly, 0.0, SW_TOP, [kerbIn]); // kerb ring (its underside covers the deck's hole edge)
-    addExtruded(sauloMat, kerbIn, 0.03, SW_TOP - 0.03 + 0.005, [walkIn]); // the top walk
+    addKerb(poly, [kerbIn]); // kerb ring (its underside covers the deck's hole edge)
+    addSlab(sauloMat, kerbIn, [walkIn]); // the top walk
     addGeo(lawnMat, buildBankGeometry(walkIn, floor, SW_TOP, -depth)); // the banks
     addFlat(lawnMat, floor, -depth);
     const floorIn = offsetPolygonInward(floor, 1.5) || floor;
@@ -795,10 +984,10 @@ function buildCityGrid(scene) {
   // ---- A square (plaça): granite paving over the whole island, trees in cast-iron grates, benches round the edge,
   //      lamps on the perimeter
   function buildPlazaBlock(b, poly) {
-    addExtruded(curbMat, poly, 0.0, SW_TOP);
+    addKerb(poly);
     const top = offsetPolygonInward(poly, 0.25);
     if (!top) return;
-    const g = createExtrudedPolygonMesh(top, 0.03, SW_TOP - 0.03 + 0.005, pavingMat).geometry;
+    const g = relief ? (latticeCapGeometry(top, [], SW_TOP + 0.005, LATTICE, THREE.ShapeUtils.triangulateShape) || createFlatPolygonMesh(top, SW_TOP + 0.005, pavingMat).geometry) : createExtrudedPolygonMesh(top, 0.03, SW_TOP - 0.03 + 0.005, pavingMat).geometry;
     setPavingStyle(g, 1);
     addGeo(pavingMat, g);
     const bb = polygonBounds(poly);
@@ -807,7 +996,7 @@ function buildCityGrid(scene) {
     if (narrow < 7) return;
     scatterInPolygon(top, 9, 3.2, 0.3, (x, z, r, r2) => {
       addTree(x, SW_TOP, z, 0.7 + r2 * 0.25, r < 0.7 ? 0 : 2, { tier: 1 });
-      grateSpots.push([x, SW_TOP + 0.006, z]);
+      grateSpots.push([x, SW_TOP + 0.006 + lift(x, z), z]);
       addFootprint(x, z, 1.4, 1.4);
     });
     alongPolygonEdges(top, 8, 16, (x, z, ux, uz, inx, inz) => {
@@ -818,10 +1007,10 @@ function buildCityGrid(scene) {
 
   // ---- Sports ground: kerb, pitch turf, a 3 m fence
   function buildSportsBlock(b, poly) {
-    addExtruded(curbMat, poly, 0.0, SW_TOP);
+    addKerb(poly);
     const top = offsetPolygonInward(poly, 0.25);
     if (!top) return;
-    addExtruded(meadowMat, top, 0.03, SW_TOP - 0.03 + 0.005);
+    addSlab(meadowMat, top);
     const fence = offsetPolygonInward(poly, 1.2);
     if (fence && b.area > 1500) {
       // gates in the middle of the two longest sides
@@ -874,9 +1063,9 @@ function buildCityGrid(scene) {
     const walkIn = offsetPolygonInward(poly, walkW);
     const wallIn = offsetPolygonInward(poly, walkW + 0.4);
     if (!kerbIn || !walkIn || !wallIn) { addFlat(mudMat, poly, GROUND_Y); return; }
-    addExtruded(curbMat, poly, 0.0, SW_TOP, [kerbIn]);
+    addKerb(poly, [kerbIn]);
     if (wide) {
-      addExtruded(sidewalkMat, kerbIn, 0.03, SW_TOP - 0.03 + 0.005, [walkIn]);
+      addSlab(sidewalkMat, kerbIn, [walkIn]);
       alongPolygonEdges(kerbIn, 10, 24, (x, z, ux, uz, inx, inz) => {
         if (prand(x, z, 14) < 0.2) return;
         addTree(x + inx * 1.0, SW_TOP, z + inz * 1.0, 0.72 + prand(x, z, 15) * 0.2, 0, { tier: 1 });
@@ -887,7 +1076,7 @@ function buildCityGrid(scene) {
     addExtruded(concreteMat, walkIn, SW_TOP, 1.0, [wallIn]);
     for (let i = 0; i < walkIn.length; i++) {
       const a = walkIn[i], c = walkIn[(i + 1) % walkIn.length];
-      addWallCollider(a.x, a.z, c.x, c.z, 1.2);
+      addWallCollider(a.x, a.z, c.x, c.z, 1.2, lift((a.x + c.x) * 0.5, (a.z + c.z) * 0.5));
     }
     // the channel: walls down from the parapet's inner face, the bed
     const segs = [];
@@ -920,9 +1109,9 @@ function buildCityGrid(scene) {
     if (poly.length < 3) continue;
     if (b.median) {
       // open medians (grass strips between carriageways): kerb & lawn
-      addExtruded(curbMat, poly, 0.0, SW_TOP);
+      addKerb(poly);
       const inner = offsetPolygonInward(poly, 0.25);
-      if (inner) addExtruded(b.cls === LAND_CLASS.PARK || b.cls === LAND_CLASS.GRASS ? lawnMat : sidewalkMat, inner, 0.03, SW_TOP - 0.03 + 0.005);
+      if (inner) addSlab(b.cls === LAND_CLASS.PARK || b.cls === LAND_CLASS.GRASS ? lawnMat : sidewalkMat, inner);
       continue;
     }
     switch (b.cls) {
@@ -1139,11 +1328,35 @@ function buildCityGrid(scene) {
 }
 
 /**
- * Height of the ground at (x, z): the asphalt deck (0), the sidewalks & park walks (WORLD_BOUNDS.sidewalkHeight), the
- * unkerbed open land, and the sunken parks (walk at street level, then the bank down to the valley floor). Valid after
- * buildCityGrid(). The channels of the rieres are fenced off (colliders), so they count as their bank's walk.
+ * Height of the ground at (x, z): the relief (terrain.js, 0 when the city is flat) plus the asphalt deck (0), the
+ * sidewalks & park walks (WORLD_BOUNDS.sidewalkHeight), the unkerbed open land, and the sunken parks (walk at street
+ * level, then the bank down to the valley floor; only without the relief). Valid after buildCityGrid(). The channels of
+ * the rieres are fenced off (colliders), so they count as their bank's walk. The one source of truth for the ground.
  */
-function groundHeightAt(x, z) {
+function groundHeightAt(x, z, hint = null) {
+  const ground = localGroundAt(x, z) + terrainY(x, z);
+  if (!terrainActive()) return ground;
+  const b = bridgeAt(x, z);
+  if (!b) return ground;
+  // on a bridge: its deck, the walks either side of the carriageway 0.15 m up; with a `hint` (the asker's current
+  // height) the level nearer to it, so whoever passes under the bridge stays under it
+  const deck = b.y + (Math.abs(b.t) > b.bridge.width * 0.5 ? SW_TOP : 0);
+  if (hint === null || hint === undefined) return Math.max(ground, deck);
+  return Math.abs(hint - deck) < Math.abs(hint - ground) ? deck : ground;
+}
+
+/** The carriageway height for a vehicle at (x, z): the roadway (never the kerbs), or a bridge deck; `hint` as above */
+function roadHeightAt(x, z, hint = null) {
+  const road = terrainY(x, z) + Math.min(0, localGroundAt(x, z));
+  if (!terrainActive()) return road;
+  const b = bridgeAt(x, z);
+  if (!b) return road;
+  if (hint === null || hint === undefined) return Math.max(road, b.y);
+  return Math.abs(hint - b.y) < Math.abs(hint - road) ? b.y : road;
+}
+
+/** The local part of groundHeightAt(): the kerb / bank / channel height over the roadway, without the relief */
+function localGroundAt(x, z) {
   const b = blockAt(x, z);
   if (!b) return 0;
   const s = sunkBlocks.get(b.id);
@@ -1171,6 +1384,8 @@ export {
   buildCityGrid,
   batchStaticGroupMeshes,
   groundHeightAt,
+  roadHeightAt,
+  localGroundAt,
   parkTreeSites,
   parkLampSites,
   pavedPlazaRects,

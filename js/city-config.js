@@ -414,6 +414,13 @@ function isTypingInField(e) {
 // main road (group 0 at each junction) is green until mainAmber, amber until mainRed; the cross streets are green from
 // mainRed until crossAmber, amber until the end of the cycle. Pedestrians cross with the traffic that runs parallel to
 // them, stepping off only on the WALK, the first `walk` seconds of its green.
+// Feature switches (NEXT_STEPS.md: every improvement lands behind one, so it can be turned off in seconds)
+const FEATURES = {
+  terrain: true, // the real relief (js/terrassa-terrain.bin via js/terrain.js); off, or without the file, the city is flat
+  terrainFile: './js/terrassa-terrain.bin', // its cell size (10 m) is the lattice the asphalt deck is drawn on
+  terrainTile: 500 // m: deck tiles, so frustum culling drops the ground behind the camera
+};
+
 const SIGNAL_TIMING = { cycle: 60, avenueAmber: 26, avenueRed: 30, streetAmber: 56, walk: 7 };
 
 // 'green', 'amber' or 'red' for the main road (isAvenue) or the cross streets at a given time
@@ -476,6 +483,7 @@ export {
   streetSpotNear,
   getLocationLabel,
   isTypingInField,
+  FEATURES,
   SIGNAL_TIMING,
   signalPhase,
   walkSignal

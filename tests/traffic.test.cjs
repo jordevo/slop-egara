@@ -182,7 +182,7 @@ function populationContext() {
   const context = {
     Math: Object.assign(Object.create(Math), { random: () => 0.5 }),
     clamp: (x, lo, hi) => Math.max(lo, Math.min(hi, x)),
-    hasView: true, camX: 0, camY: 10, camZ: 0, visible: () => true,
+    hasView: true, camX: 0, camY: 10, camZ: 0, visible: () => true, relief: false, terrainY: () => 0,
     focusX: 0, focusZ: 0, player: { active: false },
     clock: 0,
     VEHICLE_SPAWN_DISTANCE: 250, PED_SPAWN_DISTANCE: 150, NEAR_RADIUS: 350,
