@@ -82,7 +82,7 @@ Què guanyem, què perdem, què queda pendent. Si alguna part no s'ha pogut veri
 | [0009](0009-documentar-tot-a-how-to-improve.md) | Documentació exhaustiva a `HOW_TO_IMPROVE.md` després de cada pas | 2026-10-24 | Acceptada |
 | [0010](0010-cap-peticio-de-xarxa-sense-permis.md) | Cap petició de xarxa sense permís explícit del propietari | 2026-10-24 | Acceptada |
 | [0011](0011-cada-millora-darrere-d-un-interruptor-i-en-commit-aillat.md) | Cada millora darrere d'un interruptor i en un commit aïllat; dades abans que codi | 2026-10-24 | Acceptada |
-| [0012](0012-comencar-pel-relleu-real-branca-terrain.md) | Començar el full de ruta pel relleu real, en una branca `terrain` i darrere de `FEATURES.terrain` | Acceptada (fusionada a `main`) | Acceptada (en curs: branca `terrain` sense fusionar) |
+| [0012](0012-comencar-pel-relleu-real-branca-terrain.md) | Començar el full de ruta pel relleu real, en una branca `terrain` i darrere de `FEATURES.terrain` | 2026-10-25 | Acceptada (fusionada a `main`) |
 | [0013](0013-relleu-en-binari-separat-terrassa-terrain-bin.md) | El relleu viatja en un binari a part (`js/terrassa-terrain.bin`, format `TRN1`), relatiu a la Plaça Vella | 2026-10-25 | Substituïda (per VDR-0021) |
 | [0014](0014-lector-geotiff-i-utm-propis-sense-gdal.md) | Lector GeoTIFF / Arc-Info ASCII i projector UTM propis en Node, sense GDAL; el marc es llegeix de `GEO.frame` | 2026-10-25 | Acceptada |
 | [0015](0015-geo-terrain-fonts-per-preferencia-i-mode-sintetic.md) | `geo-terrain.mjs`: diversos ràsters per preferència, forats omplerts, i un mode `--synthetic` només per a desenvolupament | 2026-10-25 | Acceptada |
