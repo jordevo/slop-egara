@@ -9,7 +9,7 @@ Convención del registro de fidelidad:
 
 | Marca | Significado |
 |---|---|
-| ✅ **Exacto** | Geometría o dato real tomado tal cual de la fuente (OpenStreetMap) a escala 1:1 |
+| ✅ **Exacto** | Geometría o dato real tomado tal cual de la fuente (OpenStreetMap, Catastro, ICGC) a escala 1:1 |
 | 🟡 **Derivado** | Calculado a partir de datos reales con un modelo o heurística (p. ej. ancho de calzada a partir de la clase de vía) |
 | 🟠 **Aproximado** | Dato real incompleto completado con valores típicos del barrio o la tipología |
 | 🔴 **Inventado** | No hay dato: se genera de forma procedural plausible (igual que hacía el original con los edificios de Manhattan) |
@@ -46,11 +46,14 @@ casi norte-sur, pico secundario a 2°), basta cambiar el radio de 1500 m a 600 m
 La elección actual favorece al Eixample porque es donde hay más manzanas rectangulares, y las manzanas que no están
 alineadas reciben su propio marco de fachada (frontage frames), igual que Lower Manhattan en el original.
 
-### 1.3 Fuente de datos: solo OpenStreetMap
+### 1.3 Fuentes de datos: OpenStreetMap, Catastro e ICGC
 
-NYC tenía datos municipales abiertos (DCP, CSCL, NYC Parks). Para Terrassa se usa **exclusivamente OpenStreetMap**
-(ODbL) descargado con `tools/overpass.sh` y las consultas `tools/data/q_*.overpassql` (descarga realizada el
-2026-10-24 con permiso explícito del propietario del proyecto; los JSON están en `tools/data/terrassa/`).
+NYC tenía datos municipales abiertos (DCP, CSCL, NYC Parks). Para Terrassa la base es **OpenStreetMap** (ODbL:
+calles, usos del suelo, parques, rieras, comercios, monumentos), descargado con `tools/overpass.sh` y las consultas
+`tools/data/q_*.overpassql` (2026-10-24, con permiso explícito del propietario; los JSON están en
+`tools/data/terrassa/`). Desde la sesión 2 los **edificios** vienen del Catastro INSPIRE (§2.5) y desde la sesión 3 el
+**relieve** del modelo de elevaciones de 5 m del ICGC (§2.8, archivado comprimido en `tools/data/dem/`). Cada
+descarga se ha hecho con autorización expresa.
 
 | Fichero | Contenido | Tamaño | Notas de cobertura |
 |---|---|---|---|
@@ -76,9 +79,8 @@ NYC tenía datos municipales abiertos (DCP, CSCL, NYC Parks). Para Terrassa se u
   calzada), que sustituirían el modelo heurístico de anchos (§2.2).
 - **Barrios:** el Ajuntament de Terrassa publica los límites oficiales de los 45 barris y 6 districtes en su portal
   de datos abiertos (`opendata.terrassa.cat`); sustituirían la asignación por nodo más cercano (§2.6).
-- **Relieve:** Terrassa sube de ~250 m (sur) a ~400 m (norte) y tiene la Serra de l'Obac/Sant Llorenç del Munt al
-  norte. El MDE del ICGC (5 m) o SRTM darían un terreno real. Por ahora la ciudad es plana (como Manhattan en el
-  original). Ver §4.9.
+- **Relieve:** ✅ hecho con el MDE de 5 m del ICGC (§2.8). Queda el modelo LiDAR de 2 m (solo por WMS o descarga
+  interactiva) y los pasos superiores sin etiqueta `bridge` en OSM.
 
 Para volver a descargar (requiere red; peticiones a `overpass-api.de`):
 
@@ -120,7 +122,7 @@ python3 -I tools/catastro-to-json.py tools/data/catastro tools/data/terrassa/cat
 | **Ancho de calzada** (bordillo a bordillo) | 🟡 | `width` si existe (120 vías). Si no: `carriles × ancho de carril + aparcamiento típico`: residencial sentido único ≈ 5,9 m (mediana resultante), residencial doble sentido ≥ 7,5 m, terciaria ≈ 9,5 m, secundaria ≈ 9,2 m, peatonal 4 m. Tabla `LANE`/`EXTRA` en `geo-roads.mjs` |
 | Ancho de acera | 🟠 | Constante `SIDEWALK = 2.4 m` (ver `geo-blocks.mjs`); en el Eixample real varía entre 1,5 y 3 m, en avenidas más |
 | Túneles | — | Excluidos (no se dibujan ni se circula): p. ej. la C-58 soterrada, los pasos inferiores |
-| Puentes y viaductos | 🟠 | **Se tratan a cota de calle** (ciudad plana). Donde un viaducto cruza otra calle sin nodo común, los coches no se cruzan (el grafo no los conecta) pero visualmente ambas calles están al mismo nivel. 386 tramos afectados, sobre todo la Ronda/C-58 |
+| Puentes y viaductos | 🟡 | Los 140 tramos `bridge=yes` son **tableros** a la cota de sus estribos sobre el relieve (§2.8, §5.7), con aceras y pretiles; sin pilas ni arcos 🟠. Los pasos superiores sin etiqueta (nudos de la C-58, N-150) siguen a una sola cota: la calle que cruza baja y sube en rampa limitada al 18 % 🟠. Túneles excluidos ⚪ |
 | Semáforos | ✅ | 309 nodos `highway=traffic_signals` → 236 cruces del grafo señalizados |
 | Pasos de peatones | ✅ | 3.971 pasos (cebra / semáforo / sin marcar) con su posición y la dirección de la calle |
 | Stop / ceda el paso | ✅ | 313 cruces |
@@ -442,7 +444,7 @@ fotos de referencia; (d) polígonos oficiales de barris; (e) más comercios (com
 | Bosque lejano (50.000 pinos/encinas instanciados) | 🔴 | Posiciones y especies procedurales según altura/pendiente |
 
 **Cómo mejorarlo:**
-1. **Relieve real:** importar el MDE 5 m del ICGC (o SRTM 30 m / Copernicus DEM) en `tools/` y escribir `GEO.region.dem = { x0, z0, cell, w, h, heights }`; en `surroundings.js` basta sustituir `terrainModel()` por una lectura bilineal del MDE (colores, carreteras, árboles y edificios ya muestrean `terrainHeightAt`). Con un MDE la propia ciudad podría dejar de ser plana (§2.2).
+1. **Relieve real:** ✅ dentro de la caja de detalle y 400 m alrededor (§2.8); fuera, el modelo procedural se suma a la cota del borde (`terrainModel()` en `surroundings.js` lee `terrainY()`). Mejora: ampliar el MDE (el WCS del ICGC sirve 5 m en toda Catalunya) a los 20 km del retículo regional y sustituir del todo los conos procedurales.
 2. **Edificios reales de Sabadell, Rubí, Sant Quirze, Matadepera...:** ampliar `q_region.overpassql` con `way["building"]` a < 10 km (o el Catastro INSPIRE de cada municipio) y extruirlos con la misma caja instanciada.
 3. **Cobertura forestal real:** añadir `landuse=forest`, `natural=wood/scrub`, `landuse=farmland/orchard/vineyard` a la consulta regional y pintarlos en la textura de usos para colorear el terreno y sembrar los árboles sobre bosque real.
 4. **Carreteras:** elevar puentes y viaductos (`bridge=yes`) sobre el terreno; añadir señalización y farolas de autopista.
@@ -531,7 +533,7 @@ Pendiente general: todas las alturas 🟠 pueden sustituirse por el modelo 3D de
 | Cementiri de Terrassa | contorno ✅ / interior 🔴 | Muro de 2,4 m con una puerta 🟠, pavimento y cipreses en rejilla de 9 m; nichos ⚪ |
 | Ferrocarril (19 km) | trazado ✅ / vía 🔴 | Balasto 7 m, carriles a 1,435 m: **Renfe R4 es ancho ibérico (1,668 m)**, FGC métrico (1,000 m) — corregir. Puentes ferroviarios a cota de calle |
 | Riera de les Arenes y Riera del Palau | trazado ✅ / ancho 🟠 / canal 🔴 | Canal hundido 2,4 m (Arenes) / 1,6 m con parapeto de 1 m y paseo arbolado; el canal real de la Riera de les Arenes tiene ~30 m y 4–5 m de profundidad con taludes de hormigón. Mejora: MDE + sección real |
-| Torrents (135 km) | trazado ✅ / cauce 🔴 | Franja plana de tierra y lodo; tramos bajo calle omitidos |
+| Torrents (135 km) | trazado ✅ / cauce 🟡 | El valle lo da el relieve (§2.8); encima, una franja de tierra y lodo; tramos bajo calle omitidos |
 | Semáforos (236 cruces) | nodo ✅ / poste 🟡 / aspecto y fases 🔴 | Poste en la esquina derecha de cada acceso, 430 cabezas, báculo en calzadas ≥ 11 m; ciclo único de 60 s. Mejora: inventario de semáforos y planes de fases del Ajuntament |
 | Semáforos peatonales | pasos ✅ / colocación 🟡 | 797 cabezas en los 571 pasos semaforizados de OSM; fase deducida de la vía principal del cruce |
 | Placas de calle | nombres ✅ / posición 🟡 / diseño 🟠 | Solo sobre fachada real (se comprueba contra los colisionadores de los edificios y la placa se desliza hasta 6 m por la fachada hasta encontrar pared): 4.803 en fachada; en esquinas sin edificio (solares, aparcamientos, bloques abiertos) las dos placas cuelgan de un poste azul de 2,6 m a 0,4 m del bordillo 🟠 (7.004 en 4.092 postes); ninguna en parques y campos |

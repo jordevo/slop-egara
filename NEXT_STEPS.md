@@ -12,10 +12,12 @@ Principios de trabajo para no romper nada:
 2. **Datos antes que código.** Casi todo lo que aún es "inventado" lo es por falta de datos (ver tablas de
    `HOW_TO_IMPROVE.md`). Primero se consigue el dato, se mete en `tools/`, se regenera `terrassa-geodata.js` y solo
    entonces se toca el runtime.
-3. **Verificación en tres niveles**: (a) `node --test tests/` (107 pruebas); (b) el arnés headless de los módulos de
-   construcción (en `/tools/harness/`, pendiente de mover desde el scratchpad: ejecuta city-grid → landmarks →
-   buildings → street-details con un three.js simulado y da recuentos); (c) recarga en el navegador con la consola
-   abierta y un recorrido fijo de prueba (Plaça Vella → Rambla → Vallparadís → Mútua) comparando FPS y errores.
+3. **Verificación en cuatro niveles**: (a) `node --test 'tests/**/*.test.*'` (133 pruebas); (b) la prueba de humo
+   headless `node tools/browser-smoke.mjs` (Chrome por DevTools Protocol: espera el `[init]`, teletransporta, captura
+   pantallas y evalúa métricas sobre toda la ciudad: volúmenes enterrados, props flotantes, vértices por material);
+   (c) el informe procedimental de `tools/geo-terrain.mjs` para todo lo que toque el relieve (pendientes, escalones,
+   crestas, montículos de acera); (d) recarga en el navegador con la consola abierta y un recorrido fijo de prueba
+   (Plaça Vella → Rambla → Vallparadís → Mútua) comparando FPS y errores.
 4. **Comparar contra la realidad con capturas.** Para cada monumento o calle que se mejore, guardar una captura
    "antes/después" en `docs/` junto a la foto de referencia.
 
@@ -23,41 +25,33 @@ Principios de trabajo para no romper nada:
 
 ## Eje 1 · Realismo del mapa
 
-### 1.1 Relieve real (la mejora de más impacto visual que queda)
+### 1.1 Relieve real — ✅ hecho (2026-10-25, fusionado en `main`, conmutador `FEATURES.terrain`)
 
-> **Estado 2026-10-25 (fusionado en `main`, conmutador `FEATURES.terrain`).** Hecho con el MDT real del ICGC (5 m, WCS): pipeline
-> (`tools/geo-terrain.mjs`: cotas por cruce, perfiles con limitador de pendiente, tableros de puente, membrana por
-> manzana, plataforma por edificio, informe procedimental), fichero `js/terrassa-terrain.bin` (10 m, cm, puentes),
-> `groundHeightAt()` como único punto de verdad (con nivel de puente), deck/aceras/bordillos drapeados sobre la
-> retícula, edificios en la cota de su fachada con zócalo y escalonado, tráfico/peatones/jugador/cámara/audio sobre
-> el suelo, prueba de humo headless (`tools/browser-smoke.mjs`). **Pendiente:** pasos superiores sin etiqueta
-> `bridge` (hoy rampas), túneles, pilas/arcos de los puentes, gravedad en pendiente (§2.1.2), base por instancia en
-> los materiales de fachada de los monumentos, MDT de 2 m, el 2,8 % de aceras con montículo residual. Detalle:
-> `HOW_TO_IMPROVE.md` §2.8, §3 (sesión 3), §5.7.
+**Hecho.** Modelo de elevaciones de 5 m del ICGC (WCS, archivado comprimido en `tools/data/dem/`) → `tools/geo-terrain.mjs`
+→ `js/terrassa-terrain.bin` (celdas de 10 m, centímetros sobre la Plaça Vella, tabla de puentes). La herramienta
+acondiciona el modelo para una ciudad: cotas por cruce, perfil de cada calle con limitador de pendiente y aplanado de
+crestas, tableros de puente, membrana por manzana desde su bordillo, plataformas bajo los edificios de ladera, informe
+procedimental. En el runtime `groundHeightAt(x, z, hint)` es el único punto de verdad (con nivel de puente): asfalto,
+aceras y bordillos drapeados sobre la retícula del relieve; cada volumen de edificio en la cota de su fachada con zócalo
+y escalonado; tráfico, peatones, jugador, cámara y audio sobre el suelo. Detalle y fidelidad: `HOW_TO_IMPROVE.md` §2.8,
+§3 (sesión 3), §5.7; decisiones: `VDR/0012`, `0020`–`0027`.
 
-**Qué.** Terrassa no es plana: sube de ~250 m (Can Jofresa) a ~400 m (Can Tusell), con el torrent de Vallparadís
-8–15 m hundido, la Riera de les Arenes encajada 4–5 m, y la Serra de l'Obac al norte. Hoy la ciudad es un plano a y=0 y
-el relieve exterior es procedural.
-
-**Datos.** MDE de 5 m (o 2 m) del ICGC (CC BY 4.0, descarga por hojas o WCS); alternativa Copernicus DEM 30 m.
-
-**Cómo, sin romper nada.**
-1. `tools/geo-terrain.mjs`: lee el MDE, lo remuestrea a 4 m en el marco del mundo, resta la cota de referencia de la
-   Plaça Vella y escribe `GEO.terrain = { x0, z0, cell, w, h, heights: Int16 (dm) }` (≈ 1,5 MB para la caja).
-2. **Un único punto de verdad para la altura**: `groundHeightAt(x, z)` en `city-grid.js` ya lo es (jugador, placas,
-   postes). Se amplía para sumar la altura del terreno. Todo lo que hoy apoya en y=0 (asfalto, aceras, edificios,
-   árboles, farolas, coches del tráfico, peatones) debe pasar a llamar a esa función.
-3. Orden de migración (cada paso con su conmutador `FEATURES.terrain`): suelo de asfalto como malla con alturas →
-   aceras/bordillos (extrusión siguiendo el terreno) → edificios (cada caja apoya en la cota mínima de su huella;
-   los edificios en pendiente ganan un zócalo) → red viaria (`road-network.js`: a los nodos y aristas se les añade
-   `y`, los coches interpolan) → peatones → props.
-4. Puentes y túneles por fin a su cota: los tramos `bridge=yes` se elevan sobre el terreno y los `tunnel=yes`
-   (hoy excluidos) se pueden recuperar como pasos inferiores reales (C-58, Rambla soterrada bajo la Plaça de Catalunya?).
-
-**Riesgos.** Es el cambio más transversal. Mitigación: hacerlo en una rama, activar por partes, y comparar el arnés
-(recuentos iguales) y el recorrido de prueba. La física del coche necesitará pendiente (apartado 2.1).
-
-**Esfuerzo.** 3–5 sesiones.
+**Lo que queda (por orden de impacto).**
+1. **Pasos superiores sin etiqueta `bridge`** (nudos de la C-58, N-150, enlaces de autopista: 612 de las 1.232
+   crestas cortas del informe): detectar cruces de calzadas sin nodo común y tratar la superior como tablero
+   (hoy la inferior baja y sube en rampa al 18 %). Riesgo bajo: todo en la herramienta.
+2. **Túneles** (`tunnel=yes`, hoy excluidos del grafo): recuperarlos como pasos inferiores con su propia cota (la
+   Rambla bajo la Plaça de Catalunya, la C-58). Requiere que `groundHeightAt` sepa de más de dos niveles o que el
+   túnel sea una arista con cota propia como los puentes.
+3. **Pilas, arcos y estribos** de los puentes (hoy un tablero liso con pretiles) y los puentes del Pont de Sant Pere
+   y del Passeig con su forma real (fotos).
+4. **Gravedad en pendiente** para el coche y la bici (§2.1.2): hoy solo cabecean y balancean con la superficie.
+5. **Base por instancia** en los materiales de fachada "world-space" de los monumentos (las hileras de ventanas se
+   desplazan con la cota; en `buildings.js` ya está resuelto con el atributo `base`).
+6. **MDE LiDAR de 2 m** del ICGC (solo por WMS o descarga interactiva) y, con él, celdas de 5 m donde la malla de 10 m
+   no separa la acera del interior de la manzana (calles de 6 m del casco antiguo).
+7. Ampliar el relieve real a los 20 km del entorno regional (`surroundings.js` aún suma conos procedurales fuera de la
+   caja de detalle).
 
 ### 1.2 Alturas reales de los edificios (LiDAR)
 
@@ -159,7 +153,7 @@ cabinas, fuentes, alcantarillas. Todo instanciado y barato.
   (Pacejka simplificada): subviraje natural, derrape al frenar fuerte en curva, freno de mano para girar en
   seco (muy satisfactorio en el casco antiguo).
 - Aceleración limitada por adherencia (patina al salir en mojado), reparto de frenada 60/40, ABS sencillo.
-- **Pendiente** cuando exista el relieve (1.1): gravedad longitudinal y lateral.
+- **Pendiente**: el relieve ya existe (1.1) y el coche cabecea y balancea con la superficie que pisa; falta la gravedad longitudinal y lateral (que cueste subir, que se vaya en bajada).
 - Suspensión real en el chasis: 4 muelles-amortiguador que responden al balanceo, al cabeceo y a bordillos;
   transferencia de carga que afecta al agarre.
 - Caja de cambios de 5 marchas para el sonido (hay síntesis de motor) y para la curva de aceleración.
@@ -339,14 +333,17 @@ ya reserva su recinto.
 
 ## Eje 4 · Infraestructura del proyecto
 
-- **Arnés headless en el repo** (`tools/harness/`): hoy vive en el scratchpad de la sesión. Meterlo con un comando
-  `npm run harness` (o `node tools/harness/run.mjs`) que imprime recuentos y detecta NaN/geometría degenerada.
-  Convertirlo en test de regresión (recuentos ± 5 %).
-- **Prueba de humo en navegador** con Playwright (opcional, requiere dependencia): carga la página, espera el fin de
-  `initApp`, captura la consola y una imagen del recorrido de prueba.
-- **`FEATURES`** en `city-config.js` como único sitio de conmutadores.
-- **Versionado de datos**: `GEO.version` y fecha de descarga de cada fuente en el diario.
-- **Rama por mejora grande** (relieve, física) y `main` siempre arrancable.
+- **Prueba de humo en navegador**: ✅ `tools/browser-smoke.mjs` (Chrome headless por DevTools Protocol, sin
+  dependencias; gancho `window.__slop` en `main.js`). Pendiente: convertir sus métricas (volúmenes enterrados, props
+  flotantes, vértices por material, tiempos de `[init]`) en umbrales de regresión y guardar las capturas del recorrido
+  de prueba en `docs/`.
+- **Informe procedimental del relieve**: ✅ `tools/geo-terrain.mjs` lo imprime en cada regeneración; pendiente
+  fijarle umbrales (p. ej. 0 escalones > 1 m en calzada) y hacerlo fallar.
+- **`FEATURES`** en `city-config.js` como único sitio de conmutadores: ✅ (`terrain`, `terrainFile`, `terrainTile`).
+- **Versionado de datos**: `GEO.version` y fecha de descarga de cada fuente en el diario (el MDE del ICGC está
+  archivado comprimido en `tools/data/dem/` para no depender del servicio).
+- **Decisiones**: cada decisión significativa va a `VDR/` (regla en `CLAUDE.md`).
+- **Rama por mejora grande** (física) y `main` siempre arrancable.
 
 ---
 
@@ -363,14 +360,14 @@ ya reserva su recinto.
 | 7 | Pasos de cebra pintados y peatones cruzando por ellos (1.9) | Medio | Bajo | Bajo | — |
 | 8 | Monumentos con fotos: Catedral, Mútua, Masia Freixa, mNACTEC (3) | Alto | Medio | Nulo | fotos |
 | 9 | Tráfico con destinos y rutas; autobuses de TMESA por sus líneas (2.4.2, 2.4.6) | Alto | Medio-alto | Medio | paradas OSM |
-| 10 | Relieve real (1.1) | Muy alto | Alto | Alto | MDE ICGC |
+| 10 | ~~Relieve real (1.1)~~ ✅ hecho; quedan pasos superiores sin etiqueta, túneles y pilas de puente (1.1 "Lo que queda") | Medio | Medio | Medio | — |
 | 11 | Alturas LiDAR y cubiertas (1.2, 1.3) | Medio-alto | Medio | Bajo | LiDAR/ortofoto ICGC |
 | 12 | Comercios con direcciones (1.5), árboles y farolas reales (1.6) | Medio | Medio | Bajo | datos Ajuntament |
 | 13 | Barrios oficiales (1.4), calzadas ICGC (1.7), parques (1.8) | Medio | Medio | Bajo-medio | datos |
 | 14 | Reloj continuo, clima, aparcamientos en calzada, mobiliario terrassenc (2.8, 2.2, 1.10) | Medio | Variable | Bajo | — |
 | 15 | Rendimiento: fusión de volúmenes, streaming de colisionadores (2.9) | Medio | Medio | Medio | — |
 
-Recomendación de arranque: **1 + 2 + 3 + 4** en una sesión (colisiones, semáforos, aparición equilibrada, policía:
-todo en `controllers.js`/`traffic.js`/`road-network.js`/`street-details.js`, bajo riesgo y muy perceptible), luego
-**5 + 6** (comportamiento de los coches y física), después **8** con fotos, y en paralelo preparar los datos de
-**10** y **11**.
+Recomendación: el relieve (**10**) ya está; ahora **1 + 2 + 3 + 4** en una sesión (colisiones, semáforos,
+aparición equilibrada, policía: todo en `controllers.js`/`traffic.js`/`road-network.js`/`street-details.js`, bajo
+riesgo y muy perceptible), luego **5 + 6** (comportamiento de los coches y física, ya con gravedad en pendiente),
+después **8** con fotos, y en paralelo los flecos del relieve (pasos superiores, túneles) y los datos de **11**.
